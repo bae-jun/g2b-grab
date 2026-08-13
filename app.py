@@ -111,6 +111,37 @@ def call_api(bases, operation, extra_params, log):
     return [], last_error
 
 
+def fetch_notice(bid_ntce_no, task, cache={}):
+    """공고번호로 원 입찰공고 1건 조회 (개찰결과 → 담당자 연락처 추출용)"""
+    if not bid_ntce_no:
+        return None
+    if bid_ntce_no in cache:
+        return cache[bid_ntce_no]
+    op = TASKS[task][0]
+    key = get_service_key()
+    item = None
+    for base in BID_BASES:
+        try:
+            r = requests.get(f"{base}/{op}",
+                             params={"serviceKey": key, "pageNo": 1,
+                                     "numOfRows": 10, "type": "json",
+                                     "inqryDiv": 2, "bidNtceNo": bid_ntce_no},
+                             headers=HEADERS, timeout=30)
+            if r.status_code != 200 or r.text.lstrip().startswith("<"):
+                continue
+            body = r.json().get("response", {}).get("body", {})
+            rows = body.get("items", [])
+            if isinstance(rows, dict):
+                rows = rows.get("item", [])
+            if rows:
+                item = rows[-1]  # 재공고 등 차수가 여러 개면 최신 차수
+                break
+        except Exception:
+            continue
+    cache[bid_ntce_no] = item
+    return item
+
+
 def price_of(item):
     for f in ("presmptPrce", "asignBdgtAmt", "bdgtAmt", "sucsfbidAmt"):
         v = str(item.get(f, "") or "").replace(",", "")
@@ -293,14 +324,13 @@ with c6:
     price_max_uk = st.number_input("추정가격 상한 (억원, 0=제한없음)",
                                    0.0, 10000.0, 0.0, step=0.5)
 
-if search_type == "입찰공고":
-    do_contacts = st.checkbox("공고서에서 실무담당 전화번호 추출", value=True)
-    max_attach = st.slider("공고당 첨부파일 분석 개수", 1, 5, 3,
-                           help="많을수록 정확하지만 느려집니다") if do_contacts else 0
-else:
-    do_contacts, max_attach = False, 0
-    st.caption("※ 개찰결과는 낙찰업체·낙찰금액 중심으로 조회됩니다. "
-               "'나라장터 낙찰정보서비스' 활용신청이 된 인증키여야 합니다.")
+do_contacts = st.checkbox("공고서에서 실무담당 전화번호 추출", value=True)
+max_attach = st.slider("공고당 첨부파일 분석 개수", 1, 5, 3,
+                       help="많을수록 정확하지만 느려집니다") if do_contacts else 0
+if search_type == "개찰결과":
+    st.caption("※ 개찰결과는 공고번호로 원 입찰공고를 찾아 담당자 연락처를 함께 추출합니다. "
+               "'나라장터 낙찰정보서비스' 활용신청이 된 인증키여야 하며, "
+               "건마다 공고 조회가 추가되어 시간이 더 걸립니다.")
 
 # ------------------------------------------------------------
 # 실행
@@ -418,22 +448,70 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
 
     # ---------------- 개찰결과 결과 ----------------
     else:
-        rows = [[it.get("bidNtceNo", ""), it.get("bidNtceNm", "") or
-                 it.get("prdctClsfcNoNm", ""),
-                 it.get("dminsttNm", "") or it.get("ntceInsttNm", ""),
-                 it.get("opengDt", "") or it.get("rlOpengDt", ""),
-                 it.get("bidwinnrNm", "") or it.get("opengCorpInfo", ""),
-                 price_of(it),
-                 it.get("sucsfbidRate", "")] for it in filtered]
+        rows = []
+        progress = st.progress(0.0)
+        status = st.empty()
+        for i, it in enumerate(filtered, 1):
+            no = it.get("bidNtceNo", "")
+            name = it.get("bidNtceNm", "") or it.get("prdctClsfcNoNm", "")
+            best_phone, best_ctx, src_file = "", "", ""
+            ofcl_nm, ofcl_tel, url = "", "", ""
+            status.write(f"[{i}/{len(filtered)}] {name[:35]}... 원 공고 조회 중")
+            notice = fetch_notice(no, task)
+            if notice:
+                ofcl_nm = notice.get("ntceInsttOfclNm", "")
+                ofcl_tel = notice.get("ntceInsttOfclTelNo", "")
+                url = notice.get("bidNtceDtlUrl") or notice.get("bidNtceUrl") or ""
+                if do_contacts:
+                    status.write(f"[{i}/{len(filtered)}] {name[:35]}... 공고서 분석 중")
+                    for att_name, att_url in attachments_of(notice, max_attach):
+                        try:
+                            r = requests.get(att_url, headers=HEADERS, timeout=60)
+                            if r.status_code != 200 or len(r.content) < 500:
+                                continue
+                            contacts = find_contacts(extract_text(att_name, r.content))
+                            if contacts and contacts[0][0] > 0:
+                                best_phone, best_ctx, src_file = \
+                                    contacts[0][1], contacts[0][2], att_name
+                                break
+                            elif contacts and not best_phone:
+                                best_phone, best_ctx, src_file = \
+                                    contacts[0][1], contacts[0][2], att_name
+                        except Exception:
+                            continue
+                        time.sleep(0.2)
+            state = ("추출성공" if best_phone else
+                     ("공고미확인" if not notice else
+                      ("수동확인필요" if do_contacts else "-")))
+            rows.append([no, name,
+                         it.get("dminsttNm", "") or it.get("ntceInsttNm", ""),
+                         it.get("opengDt", "") or it.get("rlOpengDt", ""),
+                         it.get("bidwinnrNm", "") or it.get("opengCorpInfo", ""),
+                         price_of(it), it.get("sucsfbidRate", ""),
+                         dept_of(best_ctx), best_phone, best_ctx, src_file,
+                         ofcl_nm, ofcl_tel, url, state])
+            progress.progress(i / len(filtered))
+            time.sleep(0.2)
+        status.empty()
+
+        if do_contacts:
+            ok = sum(1 for r in rows if r[-1] == "추출성공")
+            st.success(f"완료! 자동 추출 {ok}건 / 수동확인 필요 {len(rows) - ok}건")
 
         st.dataframe(
-            [{"공고명": r[1][:35], "수요기관": r[2], "개찰일": str(r[3])[:10],
-              "낙찰업체": r[4], "낙찰금액(억)": round(r[5] / 1e8, 2)}
-             for r in rows],
-            use_container_width=True, hide_index=True)
+            [{"공고명": r[1][:30], "수요기관": r[2], "개찰일": str(r[3])[:10],
+              "낙찰업체": r[4], "낙찰금액(억)": round(r[5] / 1e8, 2),
+              "실무담당 부서": r[7], "실무담당 전화": r[8],
+              "집행관(계약) 전화": r[12],
+              "공고 바로가기": r[13], "상태": r[-1]} for r in rows],
+            use_container_width=True, hide_index=True,
+            column_config={"공고 바로가기": st.column_config.LinkColumn(
+                "공고 바로가기", display_text="열기")})
 
         headers = ["공고번호", "공고명", "수요기관", "개찰일시",
-                   "낙찰업체", "낙찰금액(원)", "낙찰률(%)"]
+                   "낙찰업체", "낙찰금액(원)", "낙찰률(%)",
+                   "실무담당 부서", "실무담당 전화", "추출 문맥", "출처 파일",
+                   "집행관(계약담당)", "집행관 전화", "공고 상세URL", "상태"]
         st.download_button("📥 엑셀 다운로드",
                            data=make_excel(headers, rows, "개찰결과"),
                            file_name=f"개찰결과_{task}_{region_name}_{fname_date}.xlsx",
