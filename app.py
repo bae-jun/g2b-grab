@@ -219,7 +219,7 @@ def fetch_notice(bid_ntce_no, task, cache={}):
 
 def fetch_psbl_rgn(bid_ntce_no, cache={}):
     """공고번호로 참가가능(제한)지역명 목록 조회.
-    반환: 지역명 리스트(제한 없으면 ['전국'] 형태), 조회 실패 시 None"""
+    반환: 지역명 리스트 / [] (정상응답이며 제한 미지정) / None (조회 불가)"""
     if not bid_ntce_no:
         return None
     if bid_ntce_no in cache:
@@ -235,17 +235,31 @@ def fetch_psbl_rgn(bid_ntce_no, cache={}):
                              headers=HEADERS, timeout=30)
             if r.status_code != 200 or r.text.lstrip().startswith("<"):
                 continue
-            body = r.json().get("response", {}).get("body", {})
+            resp = r.json().get("response", {})
+            code = str(resp.get("header", {}).get("resultCode", ""))
+            if code not in ("00", "0"):     # 오류 응답은 '조회 불가'로 처리
+                continue
+            body = resp.get("body", {})
             rows = body.get("items", [])
             if isinstance(rows, dict):
                 rows = rows.get("item", [])
+            if isinstance(rows, dict):
+                rows = [rows]
             names = []
             for it in rows:
-                for f in ("prtcptPsblRgnNm", "prtcptLmtRgnNm", "rgnNm"):
+                if not isinstance(it, dict):
+                    continue
+                for f in ("prtcptPsblRgnNm", "prtcptLmtRgnNm", "rgnNm",
+                          "prtcptPsblRgnCdNm"):
                     v = str(it.get(f, "") or "").strip()
                     if v:
                         names.append(v)
-            result = names  # 빈 리스트 = 지역제한 정보 없음(전국으로 간주)
+            # 정상응답이지만 행이 0건이면 totalCount로 진위 확인
+            total = str(body.get("totalCount", "0"))
+            if not names and total not in ("0", ""):
+                result = None       # 행은 있다는데 지역명을 못 읽음 → 판단 보류
+            else:
+                result = names      # []: 제한 미지정(전국) 확정
             break
         except Exception:
             continue
@@ -447,6 +461,13 @@ with c3:
 with c4:
     region_name = st.selectbox("참가제한지역", list(REGIONS.keys()),
                                index=list(REGIONS.keys()).index("경상남도"))
+    include_nationwide = False
+    if region_name not in ("전체", "전국(제한없음)"):
+        include_nationwide = st.checkbox(
+            "전국(제한없음) 공고도 수요기관이 해당 지역이면 포함 (개찰결과)",
+            value=True,
+            help="나라장터 참가제한지역 필터는 전국(제한없음) 공고를 제외하지만, "
+                 "체크하면 수요기관이 선택 지역 소속인 전국 공고도 함께 잡습니다.")
 
 c5, c6 = st.columns(2)
 with c5:
@@ -601,6 +622,7 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         rows = []
         progress = st.progress(0.0)
         status = st.empty()
+        stats = {"지역 불일치": 0, "금액 범위 밖": 0, "지역정보 미확인(기관명 판정)": 0}
         for i, it in enumerate(filtered, 1):
             no = it.get("bidNtceNo", "")
             name = it.get("bidNtceNm", "") or it.get("prdctClsfcNoNm", "")
@@ -609,7 +631,22 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
             # ① 참가제한지역 확인 (나라장터 필터와 동일 기준)
             if region_name != "전체":
                 status.write(f"[{i}/{len(filtered)}] {name[:35]}... 참가제한지역 확인 중")
-                if not region_match(region_name, fetch_psbl_rgn(no), it):
+                rgn = fetch_psbl_rgn(no)
+                if rgn is None:
+                    stats["지역정보 미확인(기관명 판정)"] += 1
+                ok = region_match(region_name, rgn, it)
+                if not ok and include_nationwide:
+                    # 전국(제한없음) 공고인데 수요기관이 선택 지역 소속이면 포함
+                    is_nationwide = (rgn == []) or (
+                        rgn and any(k in " ".join(rgn)
+                                    for k in RGN_NAME_KEYWORDS["전국(제한없음)"]))
+                    if is_nationwide:
+                        kws = INSTT_KEYWORDS.get(region_name, [region_name])
+                        blob = (str(it.get("dminsttNm", "")) +
+                                str(it.get("ntceInsttNm", "")))
+                        ok = any(k in blob for k in kws)
+                if not ok:
+                    stats["지역 불일치"] += 1
                     progress.progress(i / len(filtered))
                     continue
             # ② 원 공고 조회 → 추정가격 필터 + 담당자 정보
@@ -618,6 +655,7 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
             # 원 공고의 추정가격으로 금액 필터 (공고 미확인 건은 일단 포함)
             prc = price_of(notice) if notice else 0
             if notice and (prc < p_min or (p_max and prc > p_max)):
+                stats["금액 범위 밖"] += 1
                 progress.progress(i / len(filtered))
                 continue
             if notice:
@@ -657,6 +695,7 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         status.empty()
 
         st.success(f"지역·금액 조건 충족 {len(rows)}건 (수신 {len(filtered)}건 중)")
+        st.caption(" · ".join(f"{k} {v}건" for k, v in stats.items() if v))
         if not rows:
             st.stop()
         if do_contacts:
