@@ -444,10 +444,10 @@ def attachments_of(item, limit):
 MAX_ATTACH_BYTES = 30 * 1024 * 1024   # 30MB 초과 파일은 건너뜀
 
 
-def scan_attachments(item, limit):
-    """선별된 첨부파일에서 담당자 전화번호 탐색.
-    문맥 키워드가 있는 번호를 찾는 즉시 중단(보통 공고문 1개로 끝)."""
-    best_phone, best_ctx, src_file = "", "", ""
+def scan_attachments(item, limit, use_ai=False, notice_name=""):
+    """선별된 첨부파일에서 담당자 정보 탐색.
+    반환: (phone, ctx, src_file, dept, person, via)  via: 'AI'|'규칙'|''"""
+    best = ("", "", "", "", "", "")
     for att_name, att_url in attachments_of(item, limit):
         try:
             r = requests.get(att_url, headers=HEADERS, timeout=60, stream=True)
@@ -459,16 +459,27 @@ def scan_attachments(item, limit):
             data = r.content
             if len(data) < 500 or len(data) > MAX_ATTACH_BYTES:
                 continue
-            contacts = find_contacts(extract_text(att_name, data))
+            text = extract_text(att_name, data)
+            if not text:
+                continue
+            # ① AI 정밀 추출 (키가 있을 때) — 성공 시 즉시 확정
+            if use_ai:
+                info = ai_extract_contact(text, notice_name, att_name)
+                if info:
+                    return (info["전화"], info.get("근거", ""), att_name,
+                            info.get("부서", ""), info.get("담당자", ""), "AI")
+            # ② 규칙 기반 (AI 미사용/실패 시)
+            contacts = find_contacts(text)
             if contacts and contacts[0][0] > 0:
-                return contacts[0][1], contacts[0][2], att_name   # 확정 → 즉시 종료
-            if contacts and not best_phone:
-                best_phone, best_ctx, src_file = \
-                    contacts[0][1], contacts[0][2], att_name       # 예비 후보
+                return (contacts[0][1], contacts[0][2], att_name,
+                        "", "", "규칙")
+            if contacts and not best[0]:
+                best = (contacts[0][1], contacts[0][2], att_name,
+                        "", "", "규칙")
         except Exception:
             continue
         time.sleep(0.2)
-    return best_phone, best_ctx, src_file
+    return best
 
 
 # ---------- 문서 텍스트 추출 ----------
@@ -559,6 +570,96 @@ def dept_of(ctx):
     return cands[-1] if cands else ""
 
 
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+
+def get_anthropic_key():
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"].strip()
+    except Exception:
+        return None
+
+
+def trim_for_ai(text, max_chars=6000):
+    """전화번호·담당 키워드 주변 발췌로 토큰 절약 (문서 전체 전송 방지)"""
+    if len(text) <= max_chars:
+        return text
+    spots = []
+    for kw in ("담당", "문의", "감독", "연락처", "전화"):
+        p = 0
+        while True:
+            p = text.find(kw, p)
+            if p < 0 or len(spots) > 20:
+                break
+            spots.append(p)
+            p += len(kw)
+    for m in PHONE_RE.finditer(text):
+        spots.append(m.start())
+        if len(spots) > 40:
+            break
+    if not spots:
+        return text[:max_chars // 2] + "\n...\n" + text[-max_chars // 2:]
+    spots.sort()
+    chunks, last_end = [], -1
+    for s in spots:
+        b, e = max(0, s - 400), min(len(text), s + 400)
+        if b <= last_end:
+            chunks[-1] = (chunks[-1][0], max(chunks[-1][1], e))
+        else:
+            chunks.append((b, e))
+        last_end = chunks[-1][1]
+    out = "\n...\n".join(text[b:e] for b, e in chunks)
+    return out[:max_chars]
+
+
+def ai_extract_contact(doc_text, notice_name, filename):
+    """Claude(Haiku)로 실무담당 부서·성명·전화 추출.
+    반환: {"부서","담당자","전화","구분","근거"} 또는 None(실패/미발견)"""
+    key = get_anthropic_key()
+    if not key or not doc_text:
+        return None
+    excerpt = trim_for_ai(doc_text)
+    prompt = (
+        f"다음은 나라장터 입찰공고 '{notice_name}'의 첨부문서 "
+        f"'{filename}'에서 발췌한 내용이다.\n\n"
+        "이 공사의 '실무담당자' 정보를 찾아라. 우선순위:\n"
+        "1) 공사감독/현장감독/사업담당/실무담당/주무관 등 실제 업무 담당\n"
+        "2) 위가 없으면 문의처로 안내된 담당\n"
+        "제외: 계약담당·입찰집행·회계 담당은 실무담당이 따로 있으면 제외.\n"
+        "팩스번호는 전화로 취급하지 마라.\n\n"
+        "반드시 아래 JSON만 출력(설명·백틱 금지). 못 찾으면 전화를 빈값으로:\n"
+        '{"부서":"","담당자":"","전화":"","구분":"실무|계약|문의처","근거":"발췌 원문 한 줄"}\n\n'
+        f"--- 문서 발췌 ---\n{excerpt}")
+    try:
+        r = requests.post(
+            ANTHROPIC_URL,
+            headers={"x-api-key": key,
+                     "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5", "max_tokens": 300,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=60)
+        if r.status_code != 200:
+            return None
+        parts = r.json().get("content", [])
+        txt = "".join(p.get("text", "") for p in parts
+                      if p.get("type") == "text")
+        txt = re.sub(r"```(?:json)?|```", "", txt).strip()
+        m = re.search(r"\{.*\}", txt, re.S)
+        if not m:
+            return None
+        import json as _json
+        info = _json.loads(m.group(0))
+        if not str(info.get("전화", "")).strip():
+            return None
+        info["전화"] = re.sub(r"[\s\.\)]", "-",
+                            str(info["전화"])).strip("-")
+        info["전화"] = re.sub(r"-{2,}", "-", info["전화"])
+        return info
+    except Exception:
+        return None
+
+
 def find_contacts(text):
     results = []
     if not text:
@@ -646,6 +747,19 @@ with c6:
                                    0.0, 10000.0, 0.0, step=0.5)
 
 do_contacts = st.checkbox("공고서에서 실무담당 전화번호 추출", value=True)
+use_ai = False
+if do_contacts:
+    if get_anthropic_key():
+        use_ai = st.checkbox(
+            "🤖 Claude AI 정밀 추출 사용", value=True,
+            help="공고서 내용을 Claude(Haiku)가 읽고 실무담당 부서·성명·전화를 "
+                 "구분해 추출합니다. 계약담당/팩스 오인이 크게 줄며, "
+                 "비용은 공고 1건당 약 5~10원 수준입니다. "
+                 "실패 시 자동으로 규칙 기반 추출로 대체됩니다.")
+    else:
+        st.caption("💡 앱 설정(Secrets)에 ANTHROPIC_API_KEY를 추가하면 "
+                   "Claude AI 정밀 추출을 사용할 수 있습니다 "
+                   "(부서·성명까지 구분, 정확도 향상)")
 max_attach = st.slider("공고당 첨부파일 분석 개수", 1, 5, 3,
                        help="많을수록 정확하지만 느려집니다") if do_contacts else 0
 if search_type == "개찰결과":
@@ -775,23 +889,28 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         for i, item in enumerate(filtered, 1):
             name = item.get("bidNtceNm", "")
             best_phone, best_ctx, src_file = "", "", ""
+            ai_dept, ai_person, via = "", "", ""
             if do_contacts:
                 status.write(f"[{i}/{len(filtered)}] {name[:35]}... 공고서 분석 중")
-                best_phone, best_ctx, src_file = \
-                    scan_attachments(item, max_attach)
+                best_phone, best_ctx, src_file, ai_dept, ai_person, via = \
+                    scan_attachments(item, max_attach, use_ai, name)
+            dept = ai_dept or dept_of(best_ctx)
+            if ai_person:
+                dept = f"{dept} {ai_person}".strip()
             rows.append([item.get("bidNtceNo", ""), item.get("bidNtceOrd", ""),
                          name, item.get("dminsttNm", ""), eff_price(item),
-                         dept_of(best_ctx), best_phone, best_ctx, src_file,
+                         dept, best_phone, best_ctx, src_file,
                          item.get("ntceInsttOfclNm", ""),
                          item.get("ntceInsttOfclTelNo", ""),
                          item.get("bidNtceDtlUrl") or item.get("bidNtceUrl") or "",
-                         "추출성공" if best_phone else
-                         ("수동확인필요" if do_contacts else "-")])
+                         ("AI추출" if best_phone and via == "AI" else
+                          "추출성공" if best_phone else
+                          ("수동확인필요" if do_contacts else "-"))])
             progress.progress(i / len(filtered))
         status.empty()
 
         if do_contacts:
-            ok = sum(1 for r in rows if r[-1] == "추출성공")
+            ok = sum(1 for r in rows if r[-1] in ("추출성공", "AI추출"))
             st.success(f"완료! 자동 추출 {ok}건 / 수동확인 필요 {len(rows) - ok}건")
 
         st.dataframe(
@@ -827,30 +946,49 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         seen_no = set()
 
         if region_name not in ("전체", "전국(제한없음)") and region_codes:
-            # ① 지역 제한 공고 목록 (서버 필터, 최근 120일을 1개월 단위로)
+            # ① 지역 제한 공고를 '개찰일시 기준'으로 직접 검색 (나라장터
+            #    화면과 동일한 조회구분) → 해당 기간 것만 수신되어 빠름
             notices, nerr = [], None
-            with st.spinner(f"{region_name} 제한 공고 조회 중..."):
+            with st.spinner(f"{region_name} 제한 공고 조회 중(개찰일 기준)..."):
                 for code in region_codes:
-                    part, e = call_api_chunked(
+                    part, e = call_api(
                         BID_BASES, TASKS[task][0],
-                        {"inqryDiv": 1, "prtcptLmtRgnCd": code},
-                        date_from - datetime.timedelta(days=120), date_to, log)
+                        {"inqryDiv": 2,          # 2 = 개찰일시 기준
+                         "inqryBgnDt": begin, "inqryEndDt": end,
+                         "prtcptLmtRgnCd": code}, log)
                     nerr = nerr or e
                     for n in part:
                         nno = str(n.get("bidNtceNo", ""))
                         if nno and nno not in seen_no:
                             seen_no.add(nno)
                             notices.append(n)
+            if not notices:
+                # 폴백: 개찰일시 조회 미지원/무응답 시 게시일 기준 120일 수집
+                st.caption("개찰일시 기준 조회 결과가 없어 게시일 기준으로 "
+                           "재수집합니다(시간이 더 걸립니다)")
+                with st.spinner(f"{region_name} 제한 공고 조회 중(게시일 기준)..."):
+                    for code in region_codes:
+                        part, e = call_api_chunked(
+                            BID_BASES, TASKS[task][0],
+                            {"inqryDiv": 1, "prtcptLmtRgnCd": code},
+                            date_from - datetime.timedelta(days=120),
+                            date_to, log)
+                        nerr = nerr or e
+                        for n in part:
+                            nno = str(n.get("bidNtceNo", ""))
+                            if nno and nno not in seen_no:
+                                seen_no.add(nno)
+                                notices.append(n)
             log.empty()
             if not notices and nerr:
                 st.error(f"{region_name} 제한 공고 조회 실패: {str(nerr)[:200]}")
                 st.stop()
-            # ② 개찰일 필터 (공고 응답의 개찰일시 사용)
+            # ② 개찰일 이중 확인 (판독 불가 건은 서버 필터를 신뢰하고 포함)
             for n in notices:
                 d = openg_date_of(n)
-                if d and date_from <= d <= date_to:
+                if d is None or (date_from <= d <= date_to):
                     cands.append((n, None))
-                elif d:
+                else:
                     stats["개찰일 범위 밖"] += 1
             st.success(f"{region_name} 제한 공고 {len(notices)}건 중 "
                        f"개찰일 {date_from}~{date_to} 해당 {len(cands)}건")
@@ -908,6 +1046,7 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
             name = (src.get("bidNtceNm", "")
                     or src.get("prdctClsfcNoNm", ""))
             best_phone, best_ctx, src_file = "", "", ""
+            ai_dept, ai_person, via = "", "", ""
             ofcl_nm, ofcl_tel, url = "", "", ""
             # 원 공고 확보 (보충 경로는 여기서 조회)
             if notice is None:
@@ -936,9 +1075,11 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                        or notice.get("bidNtceUrl") or "")
                 if do_contacts:
                     status.write(f"[{i}/{len(cands)}] {name[:35]}... 공고서 분석 중")
-                    best_phone, best_ctx, src_file = \
-                        scan_attachments(notice, max_attach)
-            state = ("추출성공" if best_phone else
+                    (best_phone, best_ctx, src_file,
+                     ai_dept, ai_person, via) = \
+                        scan_attachments(notice, max_attach, use_ai, name)
+            state = ("AI추출" if best_phone and via == "AI" else
+                     "추출성공" if best_phone else
                      ("공고미확인" if not notice else
                       ("수동확인필요" if do_contacts else "-")))
             rows.append([no, name,
@@ -947,7 +1088,9 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                          op_it.get("bidwinnrNm", "")
                          or op_it.get("opengCorpInfo", ""),
                          prc, op_it.get("sucsfbidRate", ""),
-                         dept_of(best_ctx), best_phone, best_ctx, src_file,
+                         ((f"{ai_dept} {ai_person}".strip())
+                          if (ai_dept or ai_person) else dept_of(best_ctx)),
+                         best_phone, best_ctx, src_file,
                          ofcl_nm, ofcl_tel, url, state])
             progress.progress(i / len(cands))
             time.sleep(0.2)
@@ -958,7 +1101,7 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         if not rows:
             st.stop()
         if do_contacts:
-            ok = sum(1 for r in rows if r[-1] == "추출성공")
+            ok = sum(1 for r in rows if r[-1] in ("추출성공", "AI추출"))
             st.success(f"자동 추출 {ok}건 / 수동확인 필요 {len(rows) - ok}건")
 
         st.dataframe(
