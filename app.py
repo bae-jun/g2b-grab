@@ -644,39 +644,77 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
 
     # ---------------- 개찰결과 결과 ----------------
     else:
+        # ⚡ 속도 개선: 건별 지역확인 대신, 선택 지역으로 제한된 입찰공고
+        # 목록(최근 120일)을 한 번에 받아 공고번호로 대조한다.
+        # 대조된 건은 원 공고 정보(추정가격·담당자)도 함께 확보되어
+        # 공고 재조회가 필요 없다.
+        notice_map = {}
+        if region_name not in ("전체", "전국(제한없음)") and region_codes:
+            nb = (date_from - datetime.timedelta(days=120)
+                  ).strftime("%Y%m%d") + "0000"
+            ne = date_to.strftime("%Y%m%d") + "2359"
+            with st.spinner(f"{region_name} 제한 공고 목록 대조용 조회 중..."):
+                for code in region_codes:
+                    part, _ = call_api(
+                        BID_BASES, TASKS[task][0],
+                        {"inqryDiv": 1, "inqryBgnDt": nb, "inqryEndDt": ne,
+                         "prtcptLmtRgnCd": code}, log)
+                    for n in part:
+                        notice_map[str(n.get("bidNtceNo", ""))] = n
+            log.empty()
+            st.caption(f"{region_name} 제한 공고 {len(notice_map)}건과 대조합니다")
+
         rows = []
         progress = st.progress(0.0)
         status = st.empty()
         stats = {"지역 불일치": 0, "금액 범위 밖": 0, "지역정보 미확인(기관명 판정)": 0}
         for i, it in enumerate(filtered, 1):
-            no = it.get("bidNtceNo", "")
+            no = str(it.get("bidNtceNo", ""))
             name = it.get("bidNtceNm", "") or it.get("prdctClsfcNoNm", "")
             best_phone, best_ctx, src_file = "", "", ""
             ofcl_nm, ofcl_tel, url = "", "", ""
+            notice = None
             # ① 참가제한지역 확인 (나라장터 필터와 동일 기준)
-            if region_name != "전체":
+            if region_name == "전국(제한없음)":
                 status.write(f"[{i}/{len(filtered)}] {name[:35]}... 참가제한지역 확인 중")
                 rgn = fetch_psbl_rgn(no)
                 if rgn is None:
                     stats["지역정보 미확인(기관명 판정)"] += 1
-                ok = region_match(region_name, rgn, it)
-                if not ok and include_nationwide:
-                    # 전국(제한없음) 공고인데 수요기관이 선택 지역 소속이면 포함
-                    is_nationwide = (rgn == []) or (
-                        rgn and any(k in " ".join(rgn)
-                                    for k in RGN_NAME_KEYWORDS["전국(제한없음)"]))
-                    if is_nationwide:
-                        kws = INSTT_KEYWORDS.get(region_name, [region_name])
-                        blob = (str(it.get("dminsttNm", "")) +
-                                str(it.get("ntceInsttNm", "")))
-                        ok = any(k in blob for k in kws)
-                if not ok:
+                if not region_match(region_name, rgn, it):
                     stats["지역 불일치"] += 1
                     progress.progress(i / len(filtered))
                     continue
-            # ② 원 공고 조회 → 추정가격 필터 + 담당자 정보
-            status.write(f"[{i}/{len(filtered)}] {name[:35]}... 원 공고 조회 중")
-            notice = fetch_notice(no, task)
+            elif region_name != "전체":
+                if no in notice_map:
+                    notice = notice_map[no]     # 지역제한 일치 확정 + 공고 확보
+                else:
+                    # 대조 실패 → 수요기관명이 지역 소속인 후보만 정밀 확인
+                    kws = INSTT_KEYWORDS.get(region_name, [region_name])
+                    blob = (str(it.get("dminsttNm", "")) +
+                            str(it.get("ntceInsttNm", "")))
+                    if not any(k in blob for k in kws):
+                        stats["지역 불일치"] += 1
+                        progress.progress(i / len(filtered))
+                        continue
+                    status.write(f"[{i}/{len(filtered)}] {name[:35]}... 참가제한지역 확인 중")
+                    rgn = fetch_psbl_rgn(no)
+                    if rgn:          # 지역제한 명시 → 지역명으로 판정
+                        ok = any(k in " ".join(rgn)
+                                 for k in RGN_NAME_KEYWORDS.get(region_name,
+                                                                [region_name]))
+                    elif rgn == []:  # 전국(제한없음) 공고
+                        ok = include_nationwide
+                    else:            # 확인 불가 → 기관명이 일치하므로 포함
+                        ok = True
+                        stats["지역정보 미확인(기관명 판정)"] += 1
+                    if not ok:
+                        stats["지역 불일치"] += 1
+                        progress.progress(i / len(filtered))
+                        continue
+            # ② 원 공고 확보 → 추정가격 필터 + 담당자 정보
+            if notice is None:
+                status.write(f"[{i}/{len(filtered)}] {name[:35]}... 원 공고 조회 중")
+                notice = fetch_notice(no, task)
             # 원 공고의 추정가격으로 금액 필터 (공고 미확인 건은 일단 포함)
             prc = price_of(notice) if notice else 0
             if notice and (prc < p_min or (p_max and prc > p_max)):
