@@ -25,11 +25,86 @@ st.set_page_config(page_title="나라장터 입찰정보 수집기", page_icon="
 # ------------------------------------------------------------
 # 코드표
 # ------------------------------------------------------------
+# 참가제한지역 (나라장터 검색화면과 동일한 목록, 2026 행정구역 반영)
+# 값: 참가제한지역 코드 목록. 행정구역 개편(통합·승격) 전 공고까지 잡히도록
+#     구 코드를 함께 조회한다. None이면 지역 필터 없음.
 REGIONS = {
-    "전국(제한없음)": None, "서울": "11", "부산": "26", "대구": "27",
-    "인천": "28", "광주": "29", "대전": "30", "울산": "31", "세종": "36",
-    "경기": "41", "강원": "51", "충북": "43", "충남": "44", "전북": "45",
-    "전남": "46", "경북": "47", "경남": "48", "제주": "50",
+    "전체": None,
+    "전국(제한없음)": [],            # 코드 필터 없이 조회 후 지역명으로 판별
+    "서울특별시": ["11"],
+    "전남광주통합특별시": ["46", "29"],   # 통합 전 전남(46)·광주(29) 코드 포함
+    "부산광역시": ["26"],
+    "대구광역시": ["27"],
+    "인천광역시": ["28"],
+    "대전광역시": ["30"],
+    "울산광역시": ["31"],
+    "세종특별자치시": ["36"],
+    "경기도": ["41"],
+    "충청북도": ["43"],
+    "충청남도": ["44"],
+    "경상북도": ["47"],
+    "경상남도": ["48"],
+    "제주특별자치도": ["50"],
+    "강원특별자치도": ["51", "42"],      # 특별자치도 승격 전 코드(42) 포함
+    "전북특별자치도": ["52", "45"],      # 특별자치도 승격 전 코드(45) 포함
+}
+
+# 공고의 '참가가능지역명'과 매칭하기 위한 지역명 키워드
+RGN_NAME_KEYWORDS = {
+    "전국(제한없음)": ["전국", "제한없음"],
+    "서울특별시": ["서울"],
+    "전남광주통합특별시": ["전남", "전라남도", "광주"],
+    "부산광역시": ["부산"],
+    "대구광역시": ["대구"],
+    "인천광역시": ["인천"],
+    "대전광역시": ["대전"],
+    "울산광역시": ["울산"],
+    "세종특별자치시": ["세종"],
+    "경기도": ["경기"],
+    "충청북도": ["충북", "충청북도"],
+    "충청남도": ["충남", "충청남도"],
+    "경상북도": ["경북", "경상북도"],
+    "경상남도": ["경남", "경상남도"],
+    "제주특별자치도": ["제주"],
+    "강원특별자치도": ["강원"],
+    "전북특별자치도": ["전북", "전라북도"],
+}
+
+# 참가가능지역 정보를 조회할 수 없는 공고용 예비 필터:
+# 수요기관명에 지역 소속 시·군 이름이 있으면 해당 지역으로 간주
+INSTT_KEYWORDS = {
+    "서울특별시": ["서울"],
+    "부산광역시": ["부산"],
+    "대구광역시": ["대구", "군위"],
+    "인천광역시": ["인천", "강화", "옹진"],
+    "대전광역시": ["대전"],
+    "울산광역시": ["울산"],
+    "세종특별자치시": ["세종"],
+    "경기도": ["경기", "수원", "성남", "의정부", "안양", "부천", "광명", "평택",
+             "동두천", "안산", "고양", "과천", "구리", "남양주", "오산", "시흥",
+             "군포", "의왕", "하남", "용인", "파주", "이천", "안성", "김포",
+             "화성", "광주시", "양주", "포천", "여주", "연천", "가평", "양평"],
+    "강원특별자치도": ["강원", "춘천", "원주", "강릉", "동해", "태백", "속초",
+             "삼척", "홍천", "횡성", "영월", "평창", "정선", "철원", "화천",
+             "양구", "인제", "고성", "양양"],
+    "충청북도": ["충북", "충청북도", "청주", "충주", "제천", "보은", "옥천",
+             "영동", "증평", "진천", "괴산", "음성", "단양"],
+    "충청남도": ["충남", "충청남도", "천안", "공주", "보령", "아산", "서산",
+             "논산", "계룡", "당진", "금산", "부여", "서천", "청양", "홍성",
+             "예산", "태안"],
+    "전북특별자치도": ["전북", "전라북도", "전주", "군산", "익산", "정읍", "남원",
+             "김제", "완주", "진안", "무주", "장수", "임실", "순창", "고창", "부안"],
+    "전남광주통합특별시": ["전남", "전라남도", "광주", "목포", "여수", "순천",
+             "나주", "광양", "담양", "곡성", "구례", "고흥", "보성", "화순",
+             "장흥", "강진", "해남", "영암", "무안", "함평", "영광", "장성",
+             "완도", "진도", "신안"],
+    "경상북도": ["경북", "경상북도", "포항", "경주", "김천", "안동", "구미",
+             "영주", "영천", "상주", "문경", "경산", "의성", "청송", "영양",
+             "영덕", "청도", "고령", "성주", "칠곡", "예천", "봉화", "울진", "울릉"],
+    "경상남도": ["경남", "경상남도", "창원", "진주", "통영", "사천", "김해",
+             "밀양", "거제", "양산", "의령", "함안", "창녕", "고성", "남해",
+             "하동", "산청", "함양", "거창", "합천"],
+    "제주특별자치도": ["제주", "서귀포"],
 }
 
 # 업무구분 -> (입찰공고 오퍼레이션, 개찰결과 오퍼레이션)
@@ -140,6 +215,62 @@ def fetch_notice(bid_ntce_no, task, cache={}):
             continue
     cache[bid_ntce_no] = item
     return item
+
+
+def fetch_psbl_rgn(bid_ntce_no, cache={}):
+    """공고번호로 참가가능(제한)지역명 목록 조회.
+    반환: 지역명 리스트(제한 없으면 ['전국'] 형태), 조회 실패 시 None"""
+    if not bid_ntce_no:
+        return None
+    if bid_ntce_no in cache:
+        return cache[bid_ntce_no]
+    key = get_service_key()
+    result = None
+    for base in BID_BASES:
+        try:
+            r = requests.get(f"{base}/getBidPblancListInfoPrtcptPsblRgn",
+                             params={"serviceKey": key, "pageNo": 1,
+                                     "numOfRows": 30, "type": "json",
+                                     "inqryDiv": 2, "bidNtceNo": bid_ntce_no},
+                             headers=HEADERS, timeout=30)
+            if r.status_code != 200 or r.text.lstrip().startswith("<"):
+                continue
+            body = r.json().get("response", {}).get("body", {})
+            rows = body.get("items", [])
+            if isinstance(rows, dict):
+                rows = rows.get("item", [])
+            names = []
+            for it in rows:
+                for f in ("prtcptPsblRgnNm", "prtcptLmtRgnNm", "rgnNm"):
+                    v = str(it.get(f, "") or "").strip()
+                    if v:
+                        names.append(v)
+            result = names  # 빈 리스트 = 지역제한 정보 없음(전국으로 간주)
+            break
+        except Exception:
+            continue
+    cache[bid_ntce_no] = result
+    return result
+
+
+def region_match(region_name, rgn_names, item):
+    """나라장터 참가제한지역 필터와 동일한 판정.
+    rgn_names: 공고의 참가가능지역명 목록(None=조회실패, []=제한없음)"""
+    if region_name == "전체":
+        return True
+    if rgn_names is None:
+        # 지역정보 조회 실패 → 수요기관명으로 예비 판정
+        if region_name == "전국(제한없음)":
+            return False
+        kws = INSTT_KEYWORDS.get(region_name, [region_name])
+        blob = str(item.get("dminsttNm", "")) + str(item.get("ntceInsttNm", ""))
+        return any(k in blob for k in kws)
+    if not rgn_names:          # 제한지역 미지정 = 전국(제한없음)
+        return region_name == "전국(제한없음)"
+    joined = " ".join(rgn_names)
+    if region_name == "전국(제한없음)":
+        return any(k in joined for k in RGN_NAME_KEYWORDS["전국(제한없음)"])
+    return any(k in joined for k in RGN_NAME_KEYWORDS.get(region_name, [region_name]))
 
 
 def price_of(item):
@@ -315,7 +446,7 @@ with c3:
     task = st.selectbox("업무구분", list(TASKS.keys()))
 with c4:
     region_name = st.selectbox("참가제한지역", list(REGIONS.keys()),
-                               index=list(REGIONS.keys()).index("경남"))
+                               index=list(REGIONS.keys()).index("경상남도"))
 
 c5, c6 = st.columns(2)
 with c5:
@@ -344,26 +475,38 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
     end = date_to.strftime("%Y%m%d") + "2359"
     p_min = int(price_min_uk * 100_000_000)
     p_max = int(price_max_uk * 100_000_000)  # 0이면 제한없음
-    region_code = REGIONS[region_name]
+    region_codes = REGIONS[region_name]
 
     extra = {"inqryDiv": 1, "inqryBgnDt": begin, "inqryEndDt": end}
     log = st.empty()
 
     if search_type == "입찰공고":
-        if region_code:
-            extra["prtcptLmtRgnCd"] = region_code
         op = TASKS[task][0]
         with st.spinner("입찰공고 목록 조회 중..."):
-            items, err = call_api(BID_BASES, op, extra, log)
+            if region_codes:   # 지역코드별로 조회 후 병합 (통합·개편 구코드 포함)
+                items, err, seen = [], None, set()
+                for code in region_codes:
+                    part, e = call_api(BID_BASES, op,
+                                       {**extra, "prtcptLmtRgnCd": code}, log)
+                    err = err or e
+                    for it in part:
+                        k = (it.get("bidNtceNo"), it.get("bidNtceOrd"))
+                        if k not in seen:
+                            seen.add(k)
+                            items.append(it)
+            else:              # 전체 / 전국(제한없음): 코드 필터 없이 조회
+                items, err = call_api(BID_BASES, op, extra, log)
+        if items and region_name == "전국(제한없음)":
+            # 참가제한이 걸리지 않은(전국) 공고만 남김
+            items = [it for it in items
+                     if region_match(region_name,
+                                     fetch_psbl_rgn(it.get("bidNtceNo")), it)]
     else:
         op = TASKS[task][1]
         with st.spinner("개찰결과 목록 조회 중..."):
             items, err = call_api(SCSBID_BASES, op, extra, log)
-        # 개찰결과는 지역 파라미터 미지원 → 기관명 텍스트로 2차 필터
-        if items and region_code:
-            kw = region_name
-            items = [it for it in items if kw in
-                     (str(it.get("dminsttNm", "")) + str(it.get("ntceInsttNm", "")))]
+        # 지역 필터는 아래 루프에서 공고번호로 '참가가능지역'을 조회해
+        # 나라장터 참가제한지역 필터와 동일한 기준으로 적용한다.
 
     log.empty()
     if err and not items:
@@ -377,9 +520,16 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         st.stop()
 
     # 금액 필터
-    filtered = [it for it in items
-                if price_of(it) >= p_min and (p_max == 0 or price_of(it) <= p_max)]
-    st.success(f"조건 충족 {len(filtered)}건 (전체 수신 {len(items)}건)")
+    # ※ 개찰결과 목록 API에는 추정가격 필드가 없으므로(모두 0으로 계산됨)
+    #   목록 단계에서는 필터하지 않고, 아래 루프에서 원 공고의 추정가격으로 필터한다.
+    if search_type == "입찰공고":
+        filtered = [it for it in items
+                    if price_of(it) >= p_min and (p_max == 0 or price_of(it) <= p_max)]
+        st.success(f"조건 충족 {len(filtered)}건 (전체 수신 {len(items)}건)")
+    else:
+        filtered = items
+        st.success(f"수신 {len(items)}건 — 건별로 참가제한지역·추정가격을 "
+                   f"확인해 필터를 적용합니다")
     if not filtered:
         st.stop()
 
@@ -456,8 +606,20 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
             name = it.get("bidNtceNm", "") or it.get("prdctClsfcNoNm", "")
             best_phone, best_ctx, src_file = "", "", ""
             ofcl_nm, ofcl_tel, url = "", "", ""
+            # ① 참가제한지역 확인 (나라장터 필터와 동일 기준)
+            if region_name != "전체":
+                status.write(f"[{i}/{len(filtered)}] {name[:35]}... 참가제한지역 확인 중")
+                if not region_match(region_name, fetch_psbl_rgn(no), it):
+                    progress.progress(i / len(filtered))
+                    continue
+            # ② 원 공고 조회 → 추정가격 필터 + 담당자 정보
             status.write(f"[{i}/{len(filtered)}] {name[:35]}... 원 공고 조회 중")
             notice = fetch_notice(no, task)
+            # 원 공고의 추정가격으로 금액 필터 (공고 미확인 건은 일단 포함)
+            prc = price_of(notice) if notice else 0
+            if notice and (prc < p_min or (p_max and prc > p_max)):
+                progress.progress(i / len(filtered))
+                continue
             if notice:
                 ofcl_nm = notice.get("ntceInsttOfclNm", "")
                 ofcl_tel = notice.get("ntceInsttOfclTelNo", "")
@@ -487,20 +649,23 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                          it.get("dminsttNm", "") or it.get("ntceInsttNm", ""),
                          it.get("opengDt", "") or it.get("rlOpengDt", ""),
                          it.get("bidwinnrNm", "") or it.get("opengCorpInfo", ""),
-                         price_of(it), it.get("sucsfbidRate", ""),
+                         prc, it.get("sucsfbidRate", ""),
                          dept_of(best_ctx), best_phone, best_ctx, src_file,
                          ofcl_nm, ofcl_tel, url, state])
             progress.progress(i / len(filtered))
             time.sleep(0.2)
         status.empty()
 
+        st.success(f"지역·금액 조건 충족 {len(rows)}건 (수신 {len(filtered)}건 중)")
+        if not rows:
+            st.stop()
         if do_contacts:
             ok = sum(1 for r in rows if r[-1] == "추출성공")
-            st.success(f"완료! 자동 추출 {ok}건 / 수동확인 필요 {len(rows) - ok}건")
+            st.success(f"자동 추출 {ok}건 / 수동확인 필요 {len(rows) - ok}건")
 
         st.dataframe(
             [{"공고명": r[1][:30], "수요기관": r[2], "개찰일": str(r[3])[:10],
-              "낙찰업체": r[4], "낙찰금액(억)": round(r[5] / 1e8, 2),
+              "낙찰업체": r[4], "추정가격(억)": round(r[5] / 1e8, 2),
               "실무담당 부서": r[7], "실무담당 전화": r[8],
               "집행관(계약) 전화": r[12],
               "공고 바로가기": r[13], "상태": r[-1]} for r in rows],
@@ -509,7 +674,7 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                 "공고 바로가기", display_text="열기")})
 
         headers = ["공고번호", "공고명", "수요기관", "개찰일시",
-                   "낙찰업체", "낙찰금액(원)", "낙찰률(%)",
+                   "낙찰업체", "추정가격(원)", "낙찰률(%)",
                    "실무담당 부서", "실무담당 전화", "추출 문맥", "출처 파일",
                    "집행관(계약담당)", "집행관 전화", "공고 상세URL", "상태"]
         st.download_button("📥 엑셀 다운로드",
