@@ -115,6 +115,15 @@ TASKS = {
     "외자":  ("getBidPblancListInfoFrgcptPPSSrch", "getOpengResultListInfoFrgcpt"),
 }
 
+# 업무구분 -> 기초금액(추정가격) 오퍼레이션
+# ※ 공사 등은 공고 목록 응답에 추정가격이 없고 이 오퍼레이션에 분리되어 있음
+TASKS_BSIS = {
+    "공사": "getBidPblancListInfoCnstwkBsisAmount",
+    "용역": "getBidPblancListInfoServcBsisAmount",
+    "물품": "getBidPblancListInfoThngBsisAmount",
+    "외자": None,
+}
+
 BID_BASES = [  # 입찰공고정보서비스 (신/구 주소)
     "http://apis.data.go.kr/1230000/ad/BidPublicInfoService",
     "http://apis.data.go.kr/1230000/BidPublicInfoService05",
@@ -217,6 +226,112 @@ def fetch_notice(bid_ntce_no, task, cache={}):
     return item
 
 
+def call_api_chunked(bases, operation, base_params, d_from, d_to, log,
+                     chunk_days=28):
+    """조회기간 제한(약 1개월)이 있는 오퍼레이션을 기간을 쪼개 전량 수집"""
+    items, seen, last_err = [], set(), None
+    cur = d_from
+    while cur <= d_to:
+        end = min(cur + datetime.timedelta(days=chunk_days - 1), d_to)
+        params = {**base_params,
+                  "inqryBgnDt": cur.strftime("%Y%m%d") + "0000",
+                  "inqryEndDt": end.strftime("%Y%m%d") + "2359"}
+        part, err = call_api(bases, operation, params, log)
+        last_err = err or last_err
+        for it in part:
+            k = (it.get("bidNtceNo"), it.get("bidNtceOrd"))
+            if k not in seen:
+                seen.add(k)
+                items.append(it)
+        cur = end + datetime.timedelta(days=1)
+    return items, (None if items else last_err)
+
+
+def fetch_bsis_price(bid_ntce_no, task, cache={}):
+    """공고번호로 기초금액 오퍼레이션에서 추정가격/기초금액 조회 (없으면 0)"""
+    op = TASKS_BSIS.get(task)
+    if not op or not bid_ntce_no:
+        return 0
+    ck = (task, bid_ntce_no)
+    if ck in cache:
+        return cache[ck]
+    key = get_service_key()
+    price = 0
+    for base in BID_BASES:
+        try:
+            r = requests.get(f"{base}/{op}",
+                             params={"serviceKey": key, "pageNo": 1,
+                                     "numOfRows": 10, "type": "json",
+                                     "inqryDiv": 2, "bidNtceNo": bid_ntce_no},
+                             headers=HEADERS, timeout=30)
+            if r.status_code != 200 or r.text.lstrip().startswith("<"):
+                continue
+            resp = r.json().get("response", {})
+            if str(resp.get("header", {}).get("resultCode", "")) not in ("00", "0"):
+                continue
+            rows = resp.get("body", {}).get("items", [])
+            if isinstance(rows, dict):
+                rows = rows.get("item", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            for it in rows:
+                p = price_of(it)
+                if p:
+                    price = p
+                    break
+            break
+        except Exception:
+            continue
+    cache[ck] = price
+    return price
+
+
+def openg_date_of(it):
+    """항목의 개찰일시를 date로 파싱 (실패 시 None)"""
+    s = str(it.get("opengDt", "") or it.get("rlOpengDt", ""))[:10]
+    s = s.replace(".", "-").replace("/", "-")
+    try:
+        return datetime.date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def fetch_openg(bid_ntce_no, task, cache={}):
+    """공고번호로 개찰결과 1건 조회 (낙찰업체·낙찰률 등)"""
+    if not bid_ntce_no:
+        return None
+    ck = (task, bid_ntce_no)
+    if ck in cache:
+        return cache[ck]
+    op = TASKS[task][1]
+    key = get_service_key()
+    item = None
+    for base in SCSBID_BASES:
+        try:
+            r = requests.get(f"{base}/{op}",
+                             params={"serviceKey": key, "pageNo": 1,
+                                     "numOfRows": 10, "type": "json",
+                                     "inqryDiv": 2, "bidNtceNo": bid_ntce_no},
+                             headers=HEADERS, timeout=30)
+            if r.status_code != 200 or r.text.lstrip().startswith("<"):
+                continue
+            resp = r.json().get("response", {})
+            if str(resp.get("header", {}).get("resultCode", "")) not in ("00", "0"):
+                continue
+            rows = resp.get("body", {}).get("items", [])
+            if isinstance(rows, dict):
+                rows = rows.get("item", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            if rows:
+                item = rows[-1]
+                break
+        except Exception:
+            continue
+    cache[ck] = item
+    return item
+
+
 def fetch_psbl_rgn(bid_ntce_no, cache={}):
     """공고번호로 참가가능(제한)지역명 목록 조회.
     반환: 지역명 리스트 / [] (정상응답이며 제한 미지정) / None (조회 불가)"""
@@ -288,7 +403,8 @@ def region_match(region_name, rgn_names, item):
 
 
 def price_of(item):
-    for f in ("presmptPrce", "asignBdgtAmt", "bdgtAmt", "sucsfbidAmt"):
+    for f in ("presmptPrce", "asignBdgtAmt", "bdgtAmt", "sucsfbidAmt",
+              "bssamt", "bssAmt", "bssAmount"):
         v = str(item.get(f, "") or "").replace(",", "")
         if v.replace(".", "").isdigit():
             return int(float(v))
@@ -296,13 +412,63 @@ def price_of(item):
 
 
 def attachments_of(item, limit):
-    out = []
+    """첨부파일 중 전화번호가 있을 법한 문서만, 공고문 우선순으로 선별"""
+    SKIP_EXT = (".dwg", ".dxf", ".zip", ".7z", ".egg", ".jpg", ".jpeg",
+                ".png", ".gif", ".tif", ".bmp", ".xls", ".xlsx", ".xlsm")
+    HIGH = ("공고문", "입찰공고", "공고서", "재공고")        # 담당자 정보 최다
+    MID = ("유의서", "현장설명", "설명서", "안내", "과업")   # 그 다음
+    LOW_NAME = ("도면", "내역", "산출", "수량", "단가", "규격서")  # 사실상 無
+    scored = []
     for i in range(1, 11):
         u = item.get(f"ntceSpecDocUrl{i}")
         n = item.get(f"ntceSpecFileNm{i}") or f"file{i}"
-        if u:
-            out.append((n, u))
-    return out[:limit]
+        if not u:
+            continue
+        low = n.lower()
+        if low.endswith(SKIP_EXT):
+            continue                       # 파싱 불가/전화번호 없음 → 다운로드 생략
+        s = 0
+        if any(k in n for k in HIGH):
+            s = 3
+        elif any(k in n for k in MID):
+            s = 2
+        elif any(k in n for k in LOW_NAME):
+            s = -1
+        if low.endswith((".pdf", ".hwp", ".hwpx", ".doc", ".docx")):
+            s += 1
+        scored.append((s, i, n, u))
+    scored.sort(key=lambda x: (-x[0], x[1]))   # 점수 높은 순, 같으면 원래 순서
+    return [(n, u) for _, _, n, u in scored[:limit]]
+
+
+MAX_ATTACH_BYTES = 30 * 1024 * 1024   # 30MB 초과 파일은 건너뜀
+
+
+def scan_attachments(item, limit):
+    """선별된 첨부파일에서 담당자 전화번호 탐색.
+    문맥 키워드가 있는 번호를 찾는 즉시 중단(보통 공고문 1개로 끝)."""
+    best_phone, best_ctx, src_file = "", "", ""
+    for att_name, att_url in attachments_of(item, limit):
+        try:
+            r = requests.get(att_url, headers=HEADERS, timeout=60, stream=True)
+            if r.status_code != 200:
+                continue
+            cl = int(r.headers.get("Content-Length") or 0)
+            if cl > MAX_ATTACH_BYTES:
+                continue
+            data = r.content
+            if len(data) < 500 or len(data) > MAX_ATTACH_BYTES:
+                continue
+            contacts = find_contacts(extract_text(att_name, data))
+            if contacts and contacts[0][0] > 0:
+                return contacts[0][1], contacts[0][2], att_name   # 확정 → 즉시 종료
+            if contacts and not best_phone:
+                best_phone, best_ctx, src_file = \
+                    contacts[0][1], contacts[0][2], att_name       # 예비 후보
+        except Exception:
+            continue
+        time.sleep(0.2)
+    return best_phone, best_ctx, src_file
 
 
 # ---------- 문서 텍스트 추출 ----------
@@ -467,9 +633,10 @@ with c4:
     if region_name not in ("전체", "전국(제한없음)"):
         include_nationwide = st.checkbox(
             "전국(제한없음) 공고도 수요기관이 해당 지역이면 포함 (개찰결과)",
-            value=True,
-            help="나라장터 참가제한지역 필터는 전국(제한없음) 공고를 제외하지만, "
-                 "체크하면 수요기관이 선택 지역 소속인 전국 공고도 함께 잡습니다.")
+            value=False,
+            help="끄면 나라장터 참가제한지역 필터와 동일합니다(빠름). "
+                 "켜면 전국 개찰목록을 추가 수신해 수요기관이 선택 지역 소속인 "
+                 "전국(제한없음) 공고까지 포함합니다(느려짐).")
 
 c5, c6 = st.columns(2)
 with c5:
@@ -525,37 +692,33 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                      if region_match(region_name,
                                      fetch_psbl_rgn(it.get("bidNtceNo")), it)]
     else:
-        op = TASKS[task][1]
-        # 낙찰정보 API의 기간 조회는 '등록일시' 기준이라 나라장터 화면의
-        # '개찰일자' 기준과 어긋난다 → 넉넉한 기간으로 받은 뒤 개찰일로 필터.
-        wide = {"inqryDiv": 1,
-                "inqryBgnDt": (date_from - datetime.timedelta(days=3)
-                               ).strftime("%Y%m%d") + "0000",
-                "inqryEndDt": (date_to + datetime.timedelta(days=2)
-                               ).strftime("%Y%m%d") + "2359"}
-        with st.spinner("개찰결과 목록 조회 중..."):
-            items, err = call_api(SCSBID_BASES, op, wide, log)
-
-        def _openg_date(it):
-            s = str(it.get("opengDt", "") or it.get("rlOpengDt", ""))[:10]
-            s = s.replace(".", "-").replace("/", "-")
-            try:
-                return datetime.date.fromisoformat(s)
-            except ValueError:
-                return None
-        if items:
-            n_all = len(items)
-            items = [it for it in items
-                     if (_openg_date(it) is None)          # 개찰일 판독불가 건은 유지
-                     or (date_from <= _openg_date(it) <= date_to)]
-            if n_all != len(items):
-                st.caption(f"개찰일 {date_from}~{date_to} 범위 밖 "
-                           f"{n_all - len(items)}건 제외")
-        # 지역 필터는 아래 루프에서 공고번호로 '참가가능지역'을 조회해
-        # 나라장터 참가제한지역 필터와 동일한 기준으로 적용한다.
+        # 지역이 선택되면 전국 개찰목록을 받을 필요가 없다(공고 기반 역방향 수집).
+        # 전국 목록은 '전체/전국(제한없음)' 선택 또는 전국공고 보충 옵션일 때만 수신.
+        need_open_list = (region_name in ("전체", "전국(제한없음)")
+                          or include_nationwide)
+        items, err = [], None
+        if need_open_list:
+            op = TASKS[task][1]
+            # 낙찰정보 API의 기간 조회는 '등록일시' 기준이라 나라장터 화면의
+            # '개찰일자' 기준과 어긋난다 → 넉넉한 기간으로 받은 뒤 개찰일로 필터.
+            wide = {"inqryDiv": 1,
+                    "inqryBgnDt": (date_from - datetime.timedelta(days=3)
+                                   ).strftime("%Y%m%d") + "0000",
+                    "inqryEndDt": (date_to + datetime.timedelta(days=2)
+                                   ).strftime("%Y%m%d") + "2359"}
+            with st.spinner("개찰결과 목록 조회 중..."):
+                items, err = call_api(SCSBID_BASES, op, wide, log)
+            if items:
+                n_all = len(items)
+                items = [it for it in items
+                         if (openg_date_of(it) is None)    # 개찰일 판독불가 건은 유지
+                         or (date_from <= openg_date_of(it) <= date_to)]
+                if n_all != len(items):
+                    st.caption(f"개찰일 {date_from}~{date_to} 범위 밖 "
+                               f"{n_all - len(items)}건 제외")
 
     log.empty()
-    if err and not items:
+    if err and not items and (search_type == "입찰공고" or need_open_list):
         st.error(f"API 조회 실패: {err}")
         if search_type == "개찰결과":
             st.info("공공데이터포털에서 '조달청_나라장터 낙찰정보서비스' "
@@ -569,14 +732,37 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
     # ※ 개찰결과 목록 API에는 추정가격 필드가 없으므로(모두 0으로 계산됨)
     #   목록 단계에서는 필터하지 않고, 아래 루프에서 원 공고의 추정가격으로 필터한다.
     if search_type == "입찰공고":
+        # 공사 등은 목록 응답에 추정가격이 없음 → 기초금액 오퍼레이션으로 보충
+        bsis_map = {}
+        if TASKS_BSIS.get(task) and any(price_of(it) == 0 for it in items):
+            with st.spinner("기초금액(추정가격) 조회 중..."):
+                brows, _ = call_api_chunked(
+                    BID_BASES, TASKS_BSIS[task], {"inqryDiv": 1},
+                    date_from, date_to, log)
+            log.empty()
+            for b in brows:
+                p = price_of(b)
+                if p:
+                    bsis_map[str(b.get("bidNtceNo", ""))] = p
+
+        def eff_price(it):
+            return price_of(it) or bsis_map.get(str(it.get("bidNtceNo", "")), 0)
+
         filtered = [it for it in items
-                    if price_of(it) >= p_min and (p_max == 0 or price_of(it) <= p_max)]
+                    if (eff_price(it) == 0)      # 가격 미확인 건은 포함
+                    or (eff_price(it) >= p_min
+                        and (p_max == 0 or eff_price(it) <= p_max))]
         st.success(f"조건 충족 {len(filtered)}건 (전체 수신 {len(items)}건)")
+        n_unk = sum(1 for it in filtered if eff_price(it) == 0)
+        if n_unk:
+            st.caption(f"추정가격 미확인 {n_unk}건 포함")
     else:
         filtered = items
-        st.success(f"개찰일 기준 수신 {len(items)}건 — 건별로 참가제한지역·"
-                   f"추정가격을 확인해 필터를 적용합니다")
-    if not filtered:
+        if need_open_list:
+            st.success(f"개찰일 기준 수신 {len(items)}건 — 건별로 참가제한지역·"
+                       f"추정가격을 확인해 필터를 적용합니다")
+    if not filtered and not (search_type == "개찰결과"
+                             and not need_open_list):
         st.stop()
 
     fname_date = today.strftime("%Y%m%d")
@@ -591,24 +777,10 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
             best_phone, best_ctx, src_file = "", "", ""
             if do_contacts:
                 status.write(f"[{i}/{len(filtered)}] {name[:35]}... 공고서 분석 중")
-                for att_name, att_url in attachments_of(item, max_attach):
-                    try:
-                        r = requests.get(att_url, headers=HEADERS, timeout=60)
-                        if r.status_code != 200 or len(r.content) < 500:
-                            continue
-                        contacts = find_contacts(extract_text(att_name, r.content))
-                        if contacts and contacts[0][0] > 0:
-                            best_phone, best_ctx, src_file = \
-                                contacts[0][1], contacts[0][2], att_name
-                            break
-                        elif contacts and not best_phone:
-                            best_phone, best_ctx, src_file = \
-                                contacts[0][1], contacts[0][2], att_name
-                    except Exception:
-                        continue
-                    time.sleep(0.2)
+                best_phone, best_ctx, src_file = \
+                    scan_attachments(item, max_attach)
             rows.append([item.get("bidNtceNo", ""), item.get("bidNtceOrd", ""),
-                         name, item.get("dminsttNm", ""), price_of(item),
+                         name, item.get("dminsttNm", ""), eff_price(item),
                          dept_of(best_ctx), best_phone, best_ctx, src_file,
                          item.get("ntceInsttOfclNm", ""),
                          item.get("ntceInsttOfclTelNo", ""),
@@ -644,120 +816,144 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
 
     # ---------------- 개찰결과 결과 ----------------
     else:
-        # ⚡ 속도 개선: 건별 지역확인 대신, 선택 지역으로 제한된 입찰공고
-        # 목록(최근 120일)을 한 번에 받아 공고번호로 대조한다.
-        # 대조된 건은 원 공고 정보(추정가격·담당자)도 함께 확보되어
-        # 공고 재조회가 필요 없다.
-        notice_map = {}
-        if region_name not in ("전체", "전국(제한없음)") and region_codes:
-            nb = (date_from - datetime.timedelta(days=120)
-                  ).strftime("%Y%m%d") + "0000"
-            ne = date_to.strftime("%Y%m%d") + "2359"
-            with st.spinner(f"{region_name} 제한 공고 목록 대조용 조회 중..."):
-                for code in region_codes:
-                    part, _ = call_api(
-                        BID_BASES, TASKS[task][0],
-                        {"inqryDiv": 1, "inqryBgnDt": nb, "inqryEndDt": ne,
-                         "prtcptLmtRgnCd": code}, log)
-                    for n in part:
-                        notice_map[str(n.get("bidNtceNo", ""))] = n
-            log.empty()
-            st.caption(f"{region_name} 제한 공고 {len(notice_map)}건과 대조합니다")
+        # ⚡ 역방향 수집: 나라장터 웹과 동일하게, 지역으로 서버 필터된
+        # '입찰공고'에서 개찰일·금액 조건에 맞는 후보를 먼저 확정한 뒤
+        # 그 후보들에 대해서만 개찰결과 조회와 공고서 분석을 수행한다.
+        # (개찰결과 API는 지역·금액 검색을 지원하지 않으므로 전국 목록을
+        #  받는 대신 이 방식이 정확하고 빠르다)
+        stats = {"개찰일 범위 밖": 0, "지역 불일치": 0, "금액 범위 밖": 0,
+                 "지역정보 미확인(기관명 판정)": 0, "추정가격 미확인(포함)": 0}
+        cands = []       # (notice or None, open_item or None) 후보 목록
+        seen_no = set()
 
-        rows = []
-        progress = st.progress(0.0)
-        status = st.empty()
-        stats = {"지역 불일치": 0, "금액 범위 밖": 0, "지역정보 미확인(기관명 판정)": 0}
-        for i, it in enumerate(filtered, 1):
-            no = str(it.get("bidNtceNo", ""))
-            name = it.get("bidNtceNm", "") or it.get("prdctClsfcNoNm", "")
-            best_phone, best_ctx, src_file = "", "", ""
-            ofcl_nm, ofcl_tel, url = "", "", ""
-            notice = None
-            # ① 참가제한지역 확인 (나라장터 필터와 동일 기준)
-            if region_name == "전국(제한없음)":
-                status.write(f"[{i}/{len(filtered)}] {name[:35]}... 참가제한지역 확인 중")
-                rgn = fetch_psbl_rgn(no)
-                if rgn is None:
-                    stats["지역정보 미확인(기관명 판정)"] += 1
-                if not region_match(region_name, rgn, it):
-                    stats["지역 불일치"] += 1
-                    progress.progress(i / len(filtered))
-                    continue
-            elif region_name != "전체":
-                if no in notice_map:
-                    notice = notice_map[no]     # 지역제한 일치 확정 + 공고 확보
-                else:
-                    # 대조 실패 → 수요기관명이 지역 소속인 후보만 정밀 확인
-                    kws = INSTT_KEYWORDS.get(region_name, [region_name])
+        if region_name not in ("전체", "전국(제한없음)") and region_codes:
+            # ① 지역 제한 공고 목록 (서버 필터, 최근 120일을 1개월 단위로)
+            notices, nerr = [], None
+            with st.spinner(f"{region_name} 제한 공고 조회 중..."):
+                for code in region_codes:
+                    part, e = call_api_chunked(
+                        BID_BASES, TASKS[task][0],
+                        {"inqryDiv": 1, "prtcptLmtRgnCd": code},
+                        date_from - datetime.timedelta(days=120), date_to, log)
+                    nerr = nerr or e
+                    for n in part:
+                        nno = str(n.get("bidNtceNo", ""))
+                        if nno and nno not in seen_no:
+                            seen_no.add(nno)
+                            notices.append(n)
+            log.empty()
+            if not notices and nerr:
+                st.error(f"{region_name} 제한 공고 조회 실패: {str(nerr)[:200]}")
+                st.stop()
+            # ② 개찰일 필터 (공고 응답의 개찰일시 사용)
+            for n in notices:
+                d = openg_date_of(n)
+                if d and date_from <= d <= date_to:
+                    cands.append((n, None))
+                elif d:
+                    stats["개찰일 범위 밖"] += 1
+            st.success(f"{region_name} 제한 공고 {len(notices)}건 중 "
+                       f"개찰일 {date_from}~{date_to} 해당 {len(cands)}건")
+            # ③ (옵션) 전국(제한없음) 공고 보충: 전국 개찰목록에서
+            #    수요기관이 지역 소속인 건만 골라 정밀 확인
+            if include_nationwide and filtered:
+                kws = INSTT_KEYWORDS.get(region_name, [region_name])
+                extra_c = 0
+                for it in filtered:
+                    no = str(it.get("bidNtceNo", ""))
+                    if no in seen_no:
+                        continue
                     blob = (str(it.get("dminsttNm", "")) +
                             str(it.get("ntceInsttNm", "")))
                     if not any(k in blob for k in kws):
-                        stats["지역 불일치"] += 1
-                        progress.progress(i / len(filtered))
                         continue
-                    status.write(f"[{i}/{len(filtered)}] {name[:35]}... 참가제한지역 확인 중")
                     rgn = fetch_psbl_rgn(no)
-                    if rgn:          # 지역제한 명시 → 지역명으로 판정
-                        ok = any(k in " ".join(rgn)
-                                 for k in RGN_NAME_KEYWORDS.get(region_name,
-                                                                [region_name]))
-                    elif rgn == []:  # 전국(제한없음) 공고
-                        ok = include_nationwide
-                    else:            # 확인 불가 → 기관명이 일치하므로 포함
-                        ok = True
+                    is_nw = (rgn == []) or (rgn and any(
+                        k in " ".join(rgn)
+                        for k in RGN_NAME_KEYWORDS["전국(제한없음)"]))
+                    if rgn is None:
                         stats["지역정보 미확인(기관명 판정)"] += 1
-                    if not ok:
+                        is_nw = True     # 확인 불가 + 기관명 일치 → 포함
+                    if is_nw:
+                        seen_no.add(no)
+                        cands.append((None, it))
+                        extra_c += 1
+                if extra_c:
+                    st.caption(f"전국(제한없음) 공고 보충 {extra_c}건 추가")
+        else:
+            # '전체' 또는 '전국(제한없음)' 선택: 전국 개찰목록 기반 (기존 방식)
+            for it in filtered:
+                no = str(it.get("bidNtceNo", ""))
+                if region_name == "전국(제한없음)":
+                    rgn = fetch_psbl_rgn(no)
+                    if rgn is None:
+                        stats["지역정보 미확인(기관명 판정)"] += 1
+                    if not region_match(region_name, rgn, it):
                         stats["지역 불일치"] += 1
-                        progress.progress(i / len(filtered))
                         continue
-            # ② 원 공고 확보 → 추정가격 필터 + 담당자 정보
+                cands.append((None, it))
+
+        if not cands:
+            st.warning("조건에 해당하는 개찰 건이 없습니다.")
+            st.caption(" · ".join(f"{k} {v}건" for k, v in stats.items() if v))
+            st.stop()
+
+        # ④ 후보별 처리: 금액 확인 → 개찰결과 조회 → 공고서 분석
+        rows = []
+        progress = st.progress(0.0)
+        status = st.empty()
+        for i, (notice, op_it) in enumerate(cands, 1):
+            src = notice if notice is not None else op_it
+            no = str(src.get("bidNtceNo", ""))
+            name = (src.get("bidNtceNm", "")
+                    or src.get("prdctClsfcNoNm", ""))
+            best_phone, best_ctx, src_file = "", "", ""
+            ofcl_nm, ofcl_tel, url = "", "", ""
+            # 원 공고 확보 (보충 경로는 여기서 조회)
             if notice is None:
-                status.write(f"[{i}/{len(filtered)}] {name[:35]}... 원 공고 조회 중")
+                status.write(f"[{i}/{len(cands)}] {name[:35]}... 원 공고 조회 중")
                 notice = fetch_notice(no, task)
-            # 원 공고의 추정가격으로 금액 필터 (공고 미확인 건은 일단 포함)
+            # 금액 필터 (공고 → 기초금액 순, 미확인 건은 포함)
             prc = price_of(notice) if notice else 0
-            if notice and (prc < p_min or (p_max and prc > p_max)):
+            if not prc:
+                status.write(f"[{i}/{len(cands)}] {name[:35]}... 기초금액 조회 중")
+                prc = fetch_bsis_price(no, task)
+            if prc and (prc < p_min or (p_max and prc > p_max)):
                 stats["금액 범위 밖"] += 1
-                progress.progress(i / len(filtered))
+                progress.progress(i / len(cands))
                 continue
+            if not prc:
+                stats["추정가격 미확인(포함)"] += 1
+            # 개찰결과 확보 (역방향 경로는 여기서 공고번호로 조회)
+            if op_it is None:
+                status.write(f"[{i}/{len(cands)}] {name[:35]}... 개찰결과 조회 중")
+                op_it = fetch_openg(no, task) or {}
+            # 담당자 정보 + 공고서 분석 (조건 확정 건만)
             if notice:
                 ofcl_nm = notice.get("ntceInsttOfclNm", "")
                 ofcl_tel = notice.get("ntceInsttOfclTelNo", "")
-                url = notice.get("bidNtceDtlUrl") or notice.get("bidNtceUrl") or ""
+                url = (notice.get("bidNtceDtlUrl")
+                       or notice.get("bidNtceUrl") or "")
                 if do_contacts:
-                    status.write(f"[{i}/{len(filtered)}] {name[:35]}... 공고서 분석 중")
-                    for att_name, att_url in attachments_of(notice, max_attach):
-                        try:
-                            r = requests.get(att_url, headers=HEADERS, timeout=60)
-                            if r.status_code != 200 or len(r.content) < 500:
-                                continue
-                            contacts = find_contacts(extract_text(att_name, r.content))
-                            if contacts and contacts[0][0] > 0:
-                                best_phone, best_ctx, src_file = \
-                                    contacts[0][1], contacts[0][2], att_name
-                                break
-                            elif contacts and not best_phone:
-                                best_phone, best_ctx, src_file = \
-                                    contacts[0][1], contacts[0][2], att_name
-                        except Exception:
-                            continue
-                        time.sleep(0.2)
+                    status.write(f"[{i}/{len(cands)}] {name[:35]}... 공고서 분석 중")
+                    best_phone, best_ctx, src_file = \
+                        scan_attachments(notice, max_attach)
             state = ("추출성공" if best_phone else
                      ("공고미확인" if not notice else
                       ("수동확인필요" if do_contacts else "-")))
             rows.append([no, name,
-                         it.get("dminsttNm", "") or it.get("ntceInsttNm", ""),
-                         it.get("opengDt", "") or it.get("rlOpengDt", ""),
-                         it.get("bidwinnrNm", "") or it.get("opengCorpInfo", ""),
-                         prc, it.get("sucsfbidRate", ""),
+                         src.get("dminsttNm", "") or src.get("ntceInsttNm", ""),
+                         src.get("opengDt", "") or src.get("rlOpengDt", ""),
+                         op_it.get("bidwinnrNm", "")
+                         or op_it.get("opengCorpInfo", ""),
+                         prc, op_it.get("sucsfbidRate", ""),
                          dept_of(best_ctx), best_phone, best_ctx, src_file,
                          ofcl_nm, ofcl_tel, url, state])
-            progress.progress(i / len(filtered))
+            progress.progress(i / len(cands))
             time.sleep(0.2)
         status.empty()
 
-        st.success(f"지역·금액 조건 충족 {len(rows)}건 (수신 {len(filtered)}건 중)")
+        st.success(f"조건 충족 {len(rows)}건 (후보 {len(cands)}건 중)")
         st.caption(" · ".join(f"{k} {v}건" for k, v in stats.items() if v))
         if not rows:
             st.stop()
