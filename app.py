@@ -7,12 +7,19 @@
 
 import re
 import io
+import os
+import ssl
+import sys
 import time
 import zlib
 import zipfile
 import struct
+import smtplib
 import datetime
+import threading
+import subprocess
 import urllib.parse
+from email.message import EmailMessage
 
 import requests
 import streamlit as st
@@ -683,6 +690,124 @@ def find_contacts(text):
     return out[:3]
 
 
+# ------------------------------------------------------------
+# 메일 발송 + 앱 내 자동 실행 스케줄러
+# ------------------------------------------------------------
+LOG_PATH = "/tmp/g2b_daily_last.log"
+MARK_PATH = "/tmp/g2b_daily_mark.txt"
+
+
+def mail_cfg():
+    """Secrets에 메일 설정이 모두 있으면 dict, 아니면 None"""
+    try:
+        s = st.secrets
+        need = ("SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_TO")
+        if not all(k in s for k in need):
+            return None
+        return {"host": s["SMTP_HOST"],
+                "port": int(s.get("SMTP_PORT", 465)),
+                "user": s["SMTP_USER"], "pw": s["SMTP_PASS"],
+                "to": s["MAIL_TO"],
+                "sender": s.get("MAIL_FROM", s["SMTP_USER"])}
+    except Exception:
+        return None
+
+
+def send_report_mail(cfg, filename, data, summary_lines):
+    msg = EmailMessage()
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    msg["Subject"] = f"[나라장터] {today} 조회 리포트"
+    msg["From"] = cfg["sender"]
+    msg["To"] = cfg["to"]
+    msg.set_content("\n".join(
+        [f"{today} 나라장터 조회 결과입니다.", ""] + list(summary_lines)
+        + ["", "- 나라장터 입찰정보 수집기 자동 발송"]))
+    if data:
+        msg.add_attachment(data, maintype="application",
+                           subtype=("vnd.openxmlformats-officedocument"
+                                    ".spreadsheetml.sheet"),
+                           filename=filename)
+    ctx = ssl.create_default_context()
+    if cfg["port"] == 465:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ctx) as s:
+            s.login(cfg["user"], cfg["pw"])
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(cfg["host"], cfg["port"]) as s:
+            s.starttls(context=ctx)
+            s.login(cfg["user"], cfg["pw"])
+            s.send_message(msg)
+
+
+def run_daily_job():
+    """daily_report.py를 하위 프로세스로 실행 (Secrets → 환경변수 전달)"""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "daily_report.py")
+    if not os.path.exists(script):
+        return False, "daily_report.py 파일이 저장소에 없습니다."
+    env = dict(os.environ)
+    try:
+        for k in ("SERVICE_KEY", "ANTHROPIC_API_KEY", "SMTP_HOST",
+                  "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_TO",
+                  "MAIL_FROM", "SEARCH_TYPE", "TASK", "REGION",
+                  "PRICE_MIN_UK", "PRICE_MAX_UK", "DAYS_BACK",
+                  "INCLUDE_NATIONWIDE", "MAX_ATTACH"):
+            if k in st.secrets:
+                env[k] = str(st.secrets[k])
+    except Exception:
+        pass
+    env["TZ"] = "Asia/Seoul"
+    try:
+        r = subprocess.run([sys.executable, script], env=env,
+                           capture_output=True, text=True, timeout=1800)
+        out = (r.stdout or "") + ("\n" + r.stderr if r.stderr else "")
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            f.write(f"실행시각: {stamp}\n{out[-4000:]}")
+        return r.returncode == 0, out[-4000:]
+    except Exception as e:
+        return False, str(e)
+
+
+def _kst_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+
+
+def _scheduler_loop(auto_time):
+    hh, mm = (int(x) for x in auto_time.split(":"))
+    while True:
+        now = _kst_now()
+        today_mark = now.strftime("%Y-%m-%d")
+        done = ""
+        try:
+            done = open(MARK_PATH, encoding="utf-8").read().strip()
+        except Exception:
+            pass
+        due = (now.hour, now.minute) >= (hh, mm)
+        if due and done != today_mark:
+            try:
+                open(MARK_PATH, "w", encoding="utf-8").write(today_mark)
+                run_daily_job()
+            except Exception:
+                pass
+        time.sleep(60)
+
+
+@st.cache_resource
+def start_scheduler():
+    """AUTO_SEND=1이고 메일 설정이 있으면 백그라운드 스케줄러 시작"""
+    try:
+        if str(st.secrets.get("AUTO_SEND", "0")) != "1" or not mail_cfg():
+            return "off"
+        auto_time = str(st.secrets.get("AUTO_TIME", "08:00"))
+        t = threading.Thread(target=_scheduler_loop, args=(auto_time,),
+                             daemon=True)
+        t.start()
+        return f"on@{auto_time}"
+    except Exception as e:
+        return f"error:{e}"
+
+
 def make_excel(headers, rows, sheet):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -766,6 +891,54 @@ if search_type == "개찰결과":
     st.caption("※ 개찰결과는 공고번호로 원 입찰공고를 찾아 담당자 연락처를 함께 추출합니다. "
                "'나라장터 낙찰정보서비스' 활용신청이 된 인증키여야 하며, "
                "건마다 공고 조회가 추가되어 시간이 더 걸립니다.")
+
+# ------------------------------------------------------------
+# 자동 발송 설정 (앱 내)
+# ------------------------------------------------------------
+sched_state = start_scheduler()
+with st.expander("⏰ 매일 자동 조회·메일 발송 설정", expanded=False):
+    mc = mail_cfg()
+    if mc:
+        st.success(f"메일 설정 완료 → 수신: {mc['to']}")
+    else:
+        st.info("앱 설정(Settings → Secrets)에 아래 항목을 추가하면 "
+                "메일 발송이 활성화됩니다:")
+        st.code('SMTP_HOST = "smtp.gmail.com"   # 네이버는 smtp.naver.com\n'
+                'SMTP_PORT = "465"\n'
+                'SMTP_USER = "보내는메일@gmail.com"\n'
+                'SMTP_PASS = "앱 비밀번호"      # 계정 비밀번호 아님!\n'
+                'MAIL_TO   = "받는메일@company.com"', language="toml")
+    if sched_state.startswith("on@"):
+        st.success(f"자동 실행 켜짐 — 매일 {sched_state[3:]} (한국시간), "
+                   f"어제~오늘 개찰분을 조회해 발송합니다")
+    else:
+        st.info("자동 실행을 켜려면 Secrets에 추가: "
+                '`AUTO_SEND = "1"`, `AUTO_TIME = "08:00"`')
+    st.caption("⚠️ 무료 Streamlit 호스팅은 접속이 없으면 앱이 잠들어 자동 실행이 "
+               "건너뛰어질 수 있습니다. uptimerobot.com(무료)에서 이 앱 주소를 "
+               "5분 간격 모니터로 등록해 두면 항상 깨어 있습니다.")
+    if os.path.exists(LOG_PATH):
+        with open(LOG_PATH, encoding="utf-8") as f:
+            st.text_area("최근 자동 실행 로그", f.read(), height=150)
+    if mc and st.button("▶ 지금 바로 조회+메일 발송 (테스트)"):
+        with st.spinner("백그라운드 조회·발송 실행 중... (수 분 소요)"):
+            ok2, out = run_daily_job()
+        (st.success if ok2 else st.error)(
+            ("발송 완료! 메일함을 확인하세요." if ok2 else "실패 — 아래 로그 확인"))
+        st.text_area("실행 로그", out, height=200)
+
+# 직전 조회 결과 메일 발송 (조회 후 세션에 보관된 파일)
+_mc = mail_cfg()
+if _mc and st.session_state.get("last_report"):
+    _fn, _sum = (st.session_state["last_report"][0],
+                 st.session_state["last_report"][2])
+    if st.button(f"📧 방금 조회 결과 메일로 발송 ({_fn})"):
+        try:
+            send_report_mail(_mc, _fn, st.session_state["last_report"][1],
+                             _sum)
+            st.success(f"발송 완료 → {_mc['to']}")
+        except Exception as e:
+            st.error(f"메일 발송 실패: {e}")
 
 # ------------------------------------------------------------
 # 실행
@@ -926,9 +1099,12 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         headers = ["공고번호", "차수", "공고명", "수요기관", "추정가격(원)",
                    "실무담당 부서", "실무담당 전화", "추출 문맥", "출처 파일",
                    "집행관(계약담당)", "집행관 전화", "공고 상세URL", "상태"]
-        st.download_button("📥 엑셀 다운로드",
-                           data=make_excel(headers, rows, "입찰공고"),
-                           file_name=f"입찰공고_{task}_{region_name}_{fname_date}.xlsx",
+        _xls = make_excel(headers, rows, "입찰공고")
+        _fn = f"입찰공고_{task}_{region_name}_{fname_date}.xlsx"
+        st.session_state["last_report"] = (
+            _fn, _xls.getvalue() if hasattr(_xls, "getvalue") else _xls,
+            [f"입찰공고 {len(rows)}건 (지역: {region_name})"])
+        st.download_button("📥 엑셀 다운로드", data=_xls, file_name=_fn,
                            mime="application/vnd.openxmlformats-officedocument"
                                 ".spreadsheetml.sheet",
                            use_container_width=True)
@@ -1118,9 +1294,13 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                    "낙찰업체", "추정가격(원)", "낙찰률(%)",
                    "실무담당 부서", "실무담당 전화", "추출 문맥", "출처 파일",
                    "집행관(계약담당)", "집행관 전화", "공고 상세URL", "상태"]
-        st.download_button("📥 엑셀 다운로드",
-                           data=make_excel(headers, rows, "개찰결과"),
-                           file_name=f"개찰결과_{task}_{region_name}_{fname_date}.xlsx",
+        _xls = make_excel(headers, rows, "개찰결과")
+        _fn = f"개찰결과_{task}_{region_name}_{fname_date}.xlsx"
+        st.session_state["last_report"] = (
+            _fn, _xls.getvalue() if hasattr(_xls, "getvalue") else _xls,
+            [f"개찰결과 {len(rows)}건 (지역: {region_name}, "
+             f"개찰일 {date_from}~{date_to})"])
+        st.download_button("📥 엑셀 다운로드", data=_xls, file_name=_fn,
                            mime="application/vnd.openxmlformats-officedocument"
                                 ".spreadsheetml.sheet",
                            use_container_width=True)
