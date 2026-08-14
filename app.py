@@ -449,11 +449,13 @@ if get_service_key() is None:
 search_type = st.radio("검색유형", ["입찰공고", "개찰결과"], horizontal=True)
 
 today = datetime.date.today()
+date_basis = "개찰일" if search_type == "개찰결과" else "공고게시일"
 c1, c2 = st.columns(2)
 with c1:
-    date_from = st.date_input("조회 시작일", today - datetime.timedelta(days=14))
+    date_from = st.date_input(f"조회 시작일 ({date_basis} 기준)",
+                              today - datetime.timedelta(days=14))
 with c2:
-    date_to = st.date_input("조회 종료일", today)
+    date_to = st.date_input(f"조회 종료일 ({date_basis} 기준)", today)
 
 c3, c4 = st.columns(2)
 with c3:
@@ -524,8 +526,31 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
                                      fetch_psbl_rgn(it.get("bidNtceNo")), it)]
     else:
         op = TASKS[task][1]
+        # 낙찰정보 API의 기간 조회는 '등록일시' 기준이라 나라장터 화면의
+        # '개찰일자' 기준과 어긋난다 → 넉넉한 기간으로 받은 뒤 개찰일로 필터.
+        wide = {"inqryDiv": 1,
+                "inqryBgnDt": (date_from - datetime.timedelta(days=3)
+                               ).strftime("%Y%m%d") + "0000",
+                "inqryEndDt": (date_to + datetime.timedelta(days=2)
+                               ).strftime("%Y%m%d") + "2359"}
         with st.spinner("개찰결과 목록 조회 중..."):
-            items, err = call_api(SCSBID_BASES, op, extra, log)
+            items, err = call_api(SCSBID_BASES, op, wide, log)
+
+        def _openg_date(it):
+            s = str(it.get("opengDt", "") or it.get("rlOpengDt", ""))[:10]
+            s = s.replace(".", "-").replace("/", "-")
+            try:
+                return datetime.date.fromisoformat(s)
+            except ValueError:
+                return None
+        if items:
+            n_all = len(items)
+            items = [it for it in items
+                     if (_openg_date(it) is None)          # 개찰일 판독불가 건은 유지
+                     or (date_from <= _openg_date(it) <= date_to)]
+            if n_all != len(items):
+                st.caption(f"개찰일 {date_from}~{date_to} 범위 밖 "
+                           f"{n_all - len(items)}건 제외")
         # 지역 필터는 아래 루프에서 공고번호로 '참가가능지역'을 조회해
         # 나라장터 참가제한지역 필터와 동일한 기준으로 적용한다.
 
@@ -549,8 +574,8 @@ if st.button("🔍 조회 시작", type="primary", use_container_width=True):
         st.success(f"조건 충족 {len(filtered)}건 (전체 수신 {len(items)}건)")
     else:
         filtered = items
-        st.success(f"수신 {len(items)}건 — 건별로 참가제한지역·추정가격을 "
-                   f"확인해 필터를 적용합니다")
+        st.success(f"개찰일 기준 수신 {len(items)}건 — 건별로 참가제한지역·"
+                   f"추정가격을 확인해 필터를 적용합니다")
     if not filtered:
         st.stop()
 
