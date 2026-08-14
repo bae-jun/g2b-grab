@@ -695,19 +695,46 @@ def find_contacts(text):
 # ------------------------------------------------------------
 LOG_PATH = "/tmp/g2b_daily_last.log"
 MARK_PATH = "/tmp/g2b_daily_mark.txt"
+MAIL_LIST_PATH = "/tmp/g2b_mail_list.txt"
+
+
+def get_recipients():
+    """수신자 목록: 앱 화면에서 저장한 목록 우선, 없으면 Secrets의 MAIL_TO"""
+    try:
+        txt = open(MAIL_LIST_PATH, encoding="utf-8").read()
+        lst = [a.strip() for a in re.split(r"[,\n;]", txt) if a.strip()]
+        if lst:
+            return lst
+    except Exception:
+        pass
+    try:
+        base = str(st.secrets.get("MAIL_TO", ""))
+        return [a.strip() for a in base.split(",") if a.strip()]
+    except Exception:
+        return []
+
+
+def save_recipients(text):
+    lst = [a.strip() for a in re.split(r"[,\n;]", text) if a.strip()]
+    bad = [a for a in lst if not re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+$", a)]
+    if bad:
+        return None, bad
+    with open(MAIL_LIST_PATH, "w", encoding="utf-8") as f:
+        f.write(", ".join(lst))
+    return lst, []
 
 
 def mail_cfg():
-    """Secrets에 메일 설정이 모두 있으면 dict, 아니면 None"""
+    """Secrets에 보내는 계정 설정이 있으면 dict, 아니면 None"""
     try:
         s = st.secrets
-        need = ("SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_TO")
+        need = ("SMTP_HOST", "SMTP_USER", "SMTP_PASS")
         if not all(k in s for k in need):
             return None
         return {"host": s["SMTP_HOST"],
                 "port": int(s.get("SMTP_PORT", 465)),
                 "user": s["SMTP_USER"], "pw": s["SMTP_PASS"],
-                "to": s["MAIL_TO"],
+                "to": ", ".join(get_recipients()),
                 "sender": s.get("MAIL_FROM", s["SMTP_USER"])}
     except Exception:
         return None
@@ -757,6 +784,9 @@ def run_daily_job():
     except Exception:
         pass
     env["TZ"] = "Asia/Seoul"
+    rcpt = get_recipients()
+    if rcpt:
+        env["MAIL_TO"] = ",".join(rcpt)   # 앱에서 등록한 수신자 우선
     try:
         r = subprocess.run([sys.executable, script], env=env,
                            capture_output=True, text=True, timeout=1800)
@@ -898,19 +928,37 @@ if search_type == "개찰결과":
 sched_state = start_scheduler()
 with st.expander("⏰ 매일 자동 조회·메일 발송 설정", expanded=False):
     mc = mail_cfg()
-    if mc:
-        st.success(f"메일 설정 완료 → 수신: {mc['to']}")
-    else:
-        st.info("앱 설정(Settings → Secrets)에 아래 항목을 추가하면 "
-                "메일 발송이 활성화됩니다:")
+    if not mc:
+        st.info("메일 발송을 켜려면 관리자가 앱 설정(Settings → Secrets)에 "
+                "보내는 계정을 1회 등록해야 합니다:")
         st.code('SMTP_HOST = "smtp.gmail.com"   # 네이버는 smtp.naver.com\n'
                 'SMTP_PORT = "465"\n'
                 'SMTP_USER = "보내는메일@gmail.com"\n'
                 'SMTP_PASS = "앱 비밀번호"      # 계정 비밀번호 아님!\n'
-                'MAIL_TO   = "받는메일@company.com"', language="toml")
+                'MAIL_TO   = "기본수신@company.com"  # 기본 수신자(선택)',
+                language="toml")
+    else:
+        # ── 수신자 등록 (앱 화면에서 누구나) ──
+        cur = ", ".join(get_recipients())
+        new_to = st.text_input(
+            "📮 메일 받을 주소 (쉼표로 여러 명 등록 가능)",
+            value=cur,
+            placeholder="hong@company.com, kim@company.com")
+        if st.button("수신자 저장"):
+            lst, bad = save_recipients(new_to)
+            if bad:
+                st.error(f"잘못된 주소: {', '.join(bad)}")
+            else:
+                st.success(f"저장 완료 — 수신자 {len(lst)}명: {', '.join(lst)}")
+        if get_recipients():
+            st.caption(f"현재 수신자: {', '.join(get_recipients())}")
+        else:
+            st.warning("수신자가 없습니다. 위에 주소를 입력하고 저장하세요.")
+        st.caption("ℹ️ 화면에서 등록한 수신자는 앱이 재배포되면 초기화됩니다. "
+                   "항상 받아야 하는 주소는 Secrets의 MAIL_TO에도 넣어두세요.")
     if sched_state.startswith("on@"):
         st.success(f"자동 실행 켜짐 — 매일 {sched_state[3:]} (한국시간), "
-                   f"어제~오늘 개찰분을 조회해 발송합니다")
+                   f"어제~오늘 개찰분을 조회해 위 수신자 전원에게 발송합니다")
     else:
         st.info("자동 실행을 켜려면 Secrets에 추가: "
                 '`AUTO_SEND = "1"`, `AUTO_TIME = "08:00"`')
@@ -920,7 +968,7 @@ with st.expander("⏰ 매일 자동 조회·메일 발송 설정", expanded=Fals
     if os.path.exists(LOG_PATH):
         with open(LOG_PATH, encoding="utf-8") as f:
             st.text_area("최근 자동 실행 로그", f.read(), height=150)
-    if mc and st.button("▶ 지금 바로 조회+메일 발송 (테스트)"):
+    if mc and get_recipients() and st.button("▶ 지금 바로 조회+메일 발송 (테스트)"):
         with st.spinner("백그라운드 조회·발송 실행 중... (수 분 소요)"):
             ok2, out = run_daily_job()
         (st.success if ok2 else st.error)(

@@ -82,6 +82,7 @@ def build_stub(widgets, secrets):
     stub.session_state = {}
     stub.cache_resource = lambda fn: fn
     stub.code = lambda *a, **k: None
+    stub.text_input = lambda label, value="", **k: _val(label, value)
     stub.text_area = lambda *a, **k: None
 
     @contextlib.contextmanager
