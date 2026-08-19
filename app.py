@@ -131,17 +131,24 @@ TASKS_BSIS = {
     "외자": None,
 }
 
-BID_BASES = [  # 입찰공고정보서비스 (신/구 주소)
-    "http://apis.data.go.kr/1230000/ad/BidPublicInfoService",
-    "http://apis.data.go.kr/1230000/BidPublicInfoService05",
-    "http://apis.data.go.kr/1230000/BidPublicInfoService04",
-    "http://apis.data.go.kr/1230000/BidPublicInfoService",
+# ※ https를 먼저 시도하고, 실패하면 http로 재시도한다.
+#    (GitHub Actions 등 일부 서버 환경에서는 http 접속이 차단되어
+#     "Max retries exceeded" 오류가 발생하므로 https가 우선이어야 한다)
+_BID_PATHS = [  # 입찰공고정보서비스 (신/구 주소)
+    "/1230000/ad/BidPublicInfoService",
+    "/1230000/BidPublicInfoService05",
+    "/1230000/BidPublicInfoService04",
+    "/1230000/BidPublicInfoService",
 ]
-SCSBID_BASES = [  # 낙찰정보서비스 (신/구 주소)
-    "http://apis.data.go.kr/1230000/as/ScsbidInfoService",
-    "http://apis.data.go.kr/1230000/ScsbidInfoService01",
-    "http://apis.data.go.kr/1230000/ScsbidInfoService",
+_SCSBID_PATHS = [  # 낙찰정보서비스 (신/구 주소)
+    "/1230000/as/ScsbidInfoService",
+    "/1230000/ScsbidInfoService01",
+    "/1230000/ScsbidInfoService",
 ]
+BID_BASES = ([f"https://apis.data.go.kr{p}" for p in _BID_PATHS]
+             + [f"http://apis.data.go.kr{p}" for p in _BID_PATHS])
+SCSBID_BASES = ([f"https://apis.data.go.kr{p}" for p in _SCSBID_PATHS]
+                + [f"http://apis.data.go.kr{p}" for p in _SCSBID_PATHS])
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 PHONE_RE = re.compile(r"0\d{1,2}[\s\-\.\)]{0,2}\d{3,4}[\s\-\.]{0,2}\d{4}")
