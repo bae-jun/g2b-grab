@@ -1,0 +1,36 @@
+name: daily report
+
+on:
+  schedule:
+    - cron: '50 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TZ: Asia/Seoul
+      SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+      SEARCH_TYPE: ${{ vars.SEARCH_TYPE || '개찰결과' }}
+      TASK: ${{ vars.TASK || '공사' }}
+      REGION: ${{ vars.REGION || '경상남도' }}
+      PRICE_MIN_UK: ${{ vars.PRICE_MIN_UK || '1.0' }}
+      PRICE_MAX_UK: ${{ vars.PRICE_MAX_UK || '0' }}
+      DAYS_BACK: ${{ vars.DAYS_BACK || '1' }}
+      INCLUDE_NATIONWIDE: ${{ vars.INCLUDE_NATIONWIDE || '0' }}
+      MAX_ATTACH: ${{ vars.MAX_ATTACH || '4' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python daily_report.py
