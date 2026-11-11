@@ -176,6 +176,22 @@ def main():
                                "inqryEndDt": today.strftime("%Y%m%d") + "2359"})
     print(f"[진단] 지역조건 없이 최근 1일 공사공고: {len(test)}건 "
           f"(사용 주소: {BASE_OK})")
+    if test:
+        s = test[0]
+        print("[진단] 응답 필드:", ", ".join(
+            f"{k}={str(v)[:20]}" for k, v in sorted(s.items())))
+    if os.environ.get("PROBE") == "1":
+        # 지역조건 조회에서 허용되는 최대 기간 확인 (호출 수 최소화)
+        for days in (1, 3, 7, 14):
+            b = today - datetime.timedelta(days=days)
+            DEBUG_LEFT[0] = 1
+            rows = fetch_all(OP_LIST, {
+                "inqryDiv": 1, "inqryBgnDt": b.strftime("%Y%m%d") + "0000",
+                "inqryEndDt": today.strftime("%Y%m%d") + "2359",
+                "prtcptLmtRgnCd": "48"})
+            print(f"[진단] 경남 지역조건 {days}일 조회: {len(rows)}건")
+        print("PROBE 모드 종료")
+        return
 
     # 1) 지역별 공고 수집 (공고번호 기준 최신 차수만)
     notices = {}
