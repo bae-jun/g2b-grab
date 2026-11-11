@@ -46,6 +46,8 @@ def service_key():
 KEY = None
 BASE_OK = None
 DEBUG_LEFT = [8]   # 진단용 원문 출력 횟수 제한
+CALLS = [0]        # API 호출 횟수 (일일 한도 보호)
+MAX_CALLS = int(os.environ.get("MAX_CALLS", "700"))
 
 
 def fetch_all(op, params):
@@ -61,6 +63,7 @@ def fetch_all(op, params):
                      "type": "json", **params}
                 for attempt in range(4):
                     try:
+                        CALLS[0] += 1
                         r = requests.get(f"{base}/{op}", params=q,
                                          headers=HEADERS, timeout=60)
                         break
@@ -134,18 +137,40 @@ def price_of(it):
     return 0
 
 
-def sigun_of(it, rgn):
-    """공사 위치 시·군 판정: 공사현장 필드 → 공고명 → 수요/공고기관명 순"""
-    if rgn != "경남":
-        return rgn
-    fields = [it.get("cnstrtsiteRgnNm"), it.get("bidNtceNm"),
-              it.get("dminsttNm"), it.get("ntceInsttNm")]
-    for f in fields:
-        s = str(f or "")
-        for sg in GN_SIGUN:
-            if sg in s:
-                return sg
-    return "경남(시군 불명)"
+def sigun_of(it):
+    """현장 미기재 공고용 보조 판정: 수요/공고기관명에서 지역 추정"""
+    s = str(it.get("dminsttNm", "") or "") + str(it.get("ntceInsttNm", "") or "")
+    if "부산" in s:
+        return "부산", "(현장 미기재)"
+    if "울산" in s:
+        return "울산", "(현장 미기재)"
+    for sg in GN_SIGUN:
+        if sg in s:
+            return "경남", sg
+    if "경남" in s or "경상남도" in s:
+        return "경남", "(현장 미기재)"
+    return None, None
+
+
+SIDO = {"부산광역시": "부산", "울산광역시": "울산", "경상남도": "경남"}
+
+
+def site_of(it):
+    """공사현장 지역명 → (광역, 시군구). 예: '경상남도 진주시' → ('경남','진주')"""
+    site = str(it.get("cnstrtsiteRgnNm", "") or "").strip()
+    for full, short in SIDO.items():
+        if site.startswith(full):
+            rest = site[len(full):].strip().split(" ")[0]
+            if short == "경남":
+                for sg in GN_SIGUN:
+                    if rest.startswith(sg):
+                        return short, sg
+                return short, rest or "(시군 미기재)"
+            return short, rest or "(구군 미기재)"
+    if not site:
+        # 현장 미기재 → 수요기관명으로 보조 판정
+        return sigun_of(it)
+    return None, None
 
 
 def is_elec(it):
@@ -169,7 +194,16 @@ def main():
         os.environ.get("DATE_FROM") or str(d_to - datetime.timedelta(days=364)))
     print(f"조회기간: {d_from} ~ {d_to}")
 
-    # 0) 진단: 지역조건 없이 최근 1일 조회가 되는지 먼저 확인
+    if os.environ.get("PROBE") == "1":
+        probe(today)
+        return
+
+    print(f"API 호출 상한: {MAX_CALLS}회")
+    collect_and_report(d_from, d_to)
+
+
+def probe(today):
+    # 진단: 지역조건 없이 최근 1일 조회가 되는지 먼저 확인
     y = today - datetime.timedelta(days=1)
     test = fetch_all(OP_LIST, {"inqryDiv": 1,
                                "inqryBgnDt": y.strftime("%Y%m%d") + "0000",
@@ -180,7 +214,7 @@ def main():
         s = test[0]
         print("[진단] 응답 필드:", ", ".join(
             f"{k}={str(v)[:20]}" for k, v in sorted(s.items())))
-    if os.environ.get("PROBE") == "1":
+    if True:
         # 지역조건 조회에서 허용되는 최대 기간 확인 (호출 수 최소화)
         for days in (1, 3, 7, 14):
             b = today - datetime.timedelta(days=days)
@@ -191,13 +225,20 @@ def main():
                 "prtcptLmtRgnCd": "48"})
             print(f"[진단] 경남 지역조건 {days}일 조회: {len(rows)}건")
         print("PROBE 모드 종료")
-        return
 
+
+def collect_and_report(d_from, d_to):
     # 1) 지역별 공고 수집 (공고번호 기준 최신 차수만)
+    #    지역조건 조회는 약 4일까지만 허용되므로 3일 단위로 나눠 조회.
+    #    호출 수가 MAX_CALLS를 넘으면 그 시점까지 받은 자료로 집계(기간 표시).
     notices = {}
-    for rgn, code in RGN_CODES.items():
-        n0 = len(notices)
-        for b, e in chunks(d_from, d_to):
+    got_until = None
+    stop = False
+    for b, e in chunks(d_from, d_to, days=3):
+        for rgn, code in RGN_CODES.items():
+            if CALLS[0] >= MAX_CALLS:
+                stop = True
+                break
             rows = fetch_all(OP_LIST, {"inqryDiv": 1, "inqryBgnDt": b,
                                        "inqryEndDt": e,
                                        "prtcptLmtRgnCd": code})
@@ -207,37 +248,28 @@ def main():
                     continue
                 old = notices.get(no)
                 if old is None or num(it.get("bidNtceOrd")) >= num(
-                        old[1].get("bidNtceOrd")):
-                    notices[no] = (rgn, it)
-        print(f"{rgn}: 공고 {len(notices) - n0}건 수신")
+                        old.get("bidNtceOrd")):
+                    notices[no] = it
+        if stop:
+            break
+        got_until = e[:8]
+    print(f"수집 완료: 공고 {len(notices)}건, API 호출 {CALLS[0]}회, "
+          f"실제 수집기간 {d_from} ~ {got_until}")
 
     if not notices:
-        print("수신된 공고가 없습니다. 인증키/활용신청을 확인하세요.")
+        print("수신된 공고가 없습니다.")
         sys.exit(1)
 
-    sample = next(iter(notices.values()))[1]
-    print("응답 필드 예시:", ", ".join(sorted(sample.keys())))
-
-    # 2) 추정가격 보충 (공사 목록에는 추정가격이 비어있는 경우가 많음)
-    need = [no for no, (_, it) in notices.items() if price_of(it) == 0]
-    bsis = {}
-    if need:
-        print(f"추정가격 보충 대상 {len(need)}건 → 기초금액 목록 조회")
-        for b, e in chunks(d_from - datetime.timedelta(days=30), d_to):
-            for r in fetch_all(OP_BSIS, {"inqryDiv": 1, "inqryBgnDt": b,
-                                         "inqryEndDt": e}):
-                p = price_of(r)
-                if p:
-                    bsis[str(r.get("bidNtceNo", ""))] = p
-
-    # 3) 집계
+    # 2) 집계: 공사현장 지역명(cnstrtsiteRgnNm) 기준
     agg = defaultdict(lambda: defaultdict(int))
-    for no, (rgn, it) in notices.items():
+    for no, it in notices.items():
         kind = str(it.get("ntceKindNm", "") or "")
         if "취소" in kind:
             continue
-        sg = sigun_of(it, rgn)
-        p = price_of(it) or bsis.get(no, 0)
+        rgn, sg = site_of(it)
+        if rgn is None:
+            continue                     # 부산·울산·경남 밖 현장
+        p = price_of(it)
         a = agg[(rgn, sg)]
         a["전체공고"] += 1
         if p == 0:
@@ -258,11 +290,12 @@ def main():
     order = sorted(agg, key=lambda k: -agg[k]["건설_대상건수"])
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["광역", "시군"] + cols)
+        w.writerow(["광역", "시군구"] + cols)
         for k in order:
             w.writerow(list(k) + [agg[k][c] for c in cols])
 
-    print("\n=== 결과 (대상 = 추정가격 1억 이상 120억 미만, 금액은 억원) ===")
+    print(f"\n=== 결과: 수집기간 {d_from} ~ {got_until}, "
+          "대상 = 추정가격 1억 이상 120억 미만, 금액은 억원 ===")
     print("광역 | 시군 | 전체공고 | 건설대상 건수 | 건설대상 금액(억) | "
           "전기통신대상 건수 | 금액미확인")
     for k in order:
