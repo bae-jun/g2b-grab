@@ -45,6 +45,7 @@ def service_key():
 
 KEY = None
 BASE_OK = None
+DEBUG_LEFT = [8]   # 진단용 원문 출력 횟수 제한
 
 
 def fetch_all(op, params):
@@ -56,7 +57,7 @@ def fetch_all(op, params):
         items, page = [], 1
         try:
             while True:
-                q = {"serviceKey": KEY, "pageNo": page, "numOfRows": 999,
+                q = {"serviceKey": KEY, "pageNo": page, "numOfRows": 100,
                      "type": "json", **params}
                 for attempt in range(4):
                     try:
@@ -71,13 +72,29 @@ def fetch_all(op, params):
                 if r.status_code != 200 or r.text.lstrip().startswith("<"):
                     last = f"HTTP {r.status_code}: {r.text[:200]}"
                     break
-                body = r.json().get("response", {}).get("body", {})
+                js = r.json()
+                resp = js.get("response", js)
+                hdr = resp.get("header", {}) or {}
+                code = str(hdr.get("resultCode", "00"))
+                if code not in ("00", "0", "000"):
+                    last = f"{code} {hdr.get('resultMsg', '')}"
+                    if DEBUG_LEFT[0] > 0:
+                        DEBUG_LEFT[0] -= 1
+                        print(f"  [응답오류] {base.split('/')[-1]}/{op} "
+                              f"{params}: {last} / 원문: {r.text[:300]}")
+                    break
+                body = resp.get("body", {}) or {}
                 rows = body.get("items", [])
                 if isinstance(rows, dict):
                     rows = rows.get("item", [])
                 if isinstance(rows, dict):
                     rows = [rows]
                 if not rows:
+                    if page == 1 and DEBUG_LEFT[0] > 0:
+                        DEBUG_LEFT[0] -= 1
+                        print(f"  [0건] {base.split('/')[-1]}/{op} {params} "
+                              f"totalCount={body.get('totalCount')} "
+                              f"원문: {r.text[:300]}")
                     BASE_OK = base
                     return items
                 items.extend(rows)
@@ -151,6 +168,14 @@ def main():
     d_from = datetime.date.fromisoformat(
         os.environ.get("DATE_FROM") or str(d_to - datetime.timedelta(days=364)))
     print(f"조회기간: {d_from} ~ {d_to}")
+
+    # 0) 진단: 지역조건 없이 최근 1일 조회가 되는지 먼저 확인
+    y = today - datetime.timedelta(days=1)
+    test = fetch_all(OP_LIST, {"inqryDiv": 1,
+                               "inqryBgnDt": y.strftime("%Y%m%d") + "0000",
+                               "inqryEndDt": today.strftime("%Y%m%d") + "2359"})
+    print(f"[진단] 지역조건 없이 최근 1일 공사공고: {len(test)}건 "
+          f"(사용 주소: {BASE_OK})")
 
     # 1) 지역별 공고 수집 (공고번호 기준 최신 차수만)
     notices = {}
