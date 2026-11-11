@@ -1,0 +1,28 @@
+name: region demand analysis
+
+# 부산청 관할 시·군별 공공 공사 발주량 1회성 분석 (작업 브랜치 push 시에만 실행)
+on:
+  push:
+    branches: [claude/busan-safety-guidance-location-12o32z]
+    paths: ['analysis/**', '.github/workflows/region-analysis.yml']
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TZ: Asia/Seoul
+      SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python analysis/region_demand.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: region-demand
+          path: out/
