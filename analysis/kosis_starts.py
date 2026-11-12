@@ -75,7 +75,7 @@ def fetch_table(org, tbl):
               "prdSe": os.environ.get("PRD_SE", "M"),
               "startPrdDe": os.environ.get("START", start.strftime("%Y%m")),
               "endPrdDe": os.environ.get("END", end.strftime("%Y%m"))}
-    for lv in ("OBJ_L2", "OBJ_L3", "OBJ_L4"):
+    for lv in ("OBJ_L2", "OBJ_L3", "OBJ_L4", "OBJ_L5"):
         if os.environ.get(lv):
             params["objL" + lv[-1]] = os.environ[lv]
     rows = get("Param/statisticsParameterData.do", params)
@@ -87,7 +87,7 @@ def fetch_table(org, tbl):
         print("행 예시:", {k: v for k, v in rows[0].items()})
     agg = defaultdict(float)
     for r in rows:
-        names = " ".join(str(r.get(f"C{i}_NM", "") or "") for i in range(1, 5))
+        names = " ".join(str(r.get(f"C{i}_NM", "") or "") for i in range(1, 6))
         if not any(w in names for w in REGION_WORDS):
             continue
         try:
