@@ -13,6 +13,7 @@ jobs:
     env:
       TZ: Asia/Seoul
       KOSIS_KEY: ${{ secrets.KOSIS_KEY }}
+      META_TBLS: '116:DT_MLTM_2202,116:DT_MLTM_6905'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

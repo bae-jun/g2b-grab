@@ -101,10 +101,32 @@ def fetch_table(org, tbl):
         print(f"KOSIS | {names} | {itm} | {v:,.0f} | {unit}")
 
 
+def show_meta(org, tbl):
+    """표의 분류(OBJ)·항목(ITM) 구조와 최근 1개월 표본 출력"""
+    meta = get("statisticsData.do", {"method": "getMeta", "type": "ITM",
+                                     "orgId": org, "tblId": tbl})
+    if not isinstance(meta, list):
+        print(f"META | {tbl} | {str(meta)[:300]}")
+        return
+    objs = defaultdict(list)
+    for m in meta:
+        objs[(m.get("OBJ_ID"), m.get("OBJ_NM"))].append(
+            f"{m.get('ITM_ID')}={m.get('ITM_NM')}")
+    for (oid, onm), items in objs.items():
+        sample = [x for x in items if any(w in x for w in REGION_WORDS)]
+        print(f"META | {tbl} | {oid} | {onm} | 항목 {len(items)}개 | "
+              f"앞부분: {items[:8]} | 지역관련: {sample[:40]}")
+
+
 def main():
     if not KEY:
         print("오류: KOSIS_KEY가 GitHub Secret에 등록되지 않았습니다.")
         sys.exit(1)
+    if os.environ.get("META_TBLS"):
+        for t in os.environ["META_TBLS"].split(","):
+            org, tbl = t.split(":")
+            show_meta(org, tbl)
+        return
     tbl = os.environ.get("TBL_ID")
     if not tbl:
         search_tables()
