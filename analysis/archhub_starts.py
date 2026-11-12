@@ -16,8 +16,7 @@ RAW = os.environ.get("SERVICE_KEY", "").strip()
 KEY = urllib.parse.unquote(RAW) if "%" in RAW else RAW
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 BASES = [
-    "https://apis.data.go.kr/1613000/ArchPmsHubService",
-    "https://apis.data.go.kr/1613000/ArchPmsService_v2",
+    "https://apis.data.go.kr/1613000/ArchPmsHubService",   # v2는 폐기 확인됨
 ]
 OP = "getApBasisOulnInfo"          # 건축인허가 기본개요
 CALLS = [0]
