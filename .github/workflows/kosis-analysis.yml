@@ -1,0 +1,22 @@
+name: kosis construction starts
+
+# 부산청 관할 시·군별 건축 착공(민간 포함) 통계 조회 (작업 브랜치 push 시에만 실행)
+on:
+  push:
+    branches: [claude/busan-safety-guidance-location-12o32z]
+    paths: ['analysis/kosis_*', '.github/workflows/kosis-analysis.yml']
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Seoul
+      KOSIS_KEY: ${{ secrets.KOSIS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python analysis/kosis_starts.py
