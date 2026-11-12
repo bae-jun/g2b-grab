@@ -1,0 +1,23 @@
+name: archhub construction starts
+
+# 건축HUB 건축인허가정보로 시·군별 착공 집계 (작업 브랜치 push 시에만 실행)
+on:
+  push:
+    branches: [claude/busan-safety-guidance-location-12o32z]
+    paths: ['analysis/archhub_*', '.github/workflows/archhub-analysis.yml']
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TZ: Asia/Seoul
+      SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+      PROBE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python analysis/archhub_starts.py
