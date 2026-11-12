@@ -1,0 +1,23 @@
+name: contract period analysis
+
+# 나라장터 계약정보로 공사금액 구간별 공사기간·지도횟수 분포 (작업 브랜치 push 시에만 실행)
+on:
+  push:
+    branches: [claude/busan-safety-guidance-location-12o32z]
+    paths: ['analysis/contract_*', '.github/workflows/contract-analysis.yml']
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TZ: Asia/Seoul
+      SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+      PROBE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python analysis/contract_periods.py
