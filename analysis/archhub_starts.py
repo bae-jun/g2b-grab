@@ -79,6 +79,8 @@ def probe():
                 print(f"  [{name}] {err}")
                 continue
             hdr, total, items = summarize(js)
+            if not items:
+                print(f"  [{name}] 원문: {json.dumps(js, ensure_ascii=False)[:400]}")
             print(f"  [{name}] 결과코드={hdr.get('resultCode')} "
                   f"메시지={hdr.get('resultMsg')} 전체건수={total} "
                   f"이번 응답 {len(items)}건")
