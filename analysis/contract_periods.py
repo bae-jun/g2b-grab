@@ -17,8 +17,7 @@ RAW = os.environ.get("SERVICE_KEY", "").strip()
 KEY = urllib.parse.unquote(RAW) if "%" in RAW else RAW
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 BASES = [
-    "https://apis.data.go.kr/1230000/ao/CntrctInfoService",
-    "https://apis.data.go.kr/1230000/CntrctInfoService01",
+    "https://apis.data.go.kr/1230000/ao/CntrctInfoService",  # 01은 폐기 확인됨
 ]
 OPS = ["getCntrctInfoListCnstwk", "getCntrctInfoListCnstwkPPSSrch"]
 CALLS = [0]
