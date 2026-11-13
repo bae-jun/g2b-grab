@@ -13,7 +13,6 @@ jobs:
     env:
       TZ: Asia/Seoul
       SERVICE_KEY: ${{ secrets.DATA_KEY2 || secrets.SERVICE_KEY }}
-      PROBE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
