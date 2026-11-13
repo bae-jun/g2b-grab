@@ -9,10 +9,11 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       TZ: Asia/Seoul
       SERVICE_KEY: ${{ secrets.DATA_KEY2 || secrets.SERVICE_KEY }}
+      SERVICE_ONLY: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

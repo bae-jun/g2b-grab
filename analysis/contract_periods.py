@@ -101,8 +101,14 @@ def fetch_day(op, day):
                              timeout=90)
             js = json.loads(r.text)
         except Exception as e:
+            if not getattr(fetch_day, "_retry", False):
+                fetch_day._retry = True
+                time.sleep(5)
+                continue
+            fetch_day._retry = False
             print(f"  [오류] {op} {d} p{page}: {e}")
             return out
+        fetch_day._retry = False
         if "nkoneps.com.response.ResponseError" in js:
             msg = str(js)[:200]
             if ROWS[0] > 100:          # 999가 거부되면 100으로 낮춰 재시도
@@ -165,6 +171,9 @@ def main():
         sys.exit(1)
     if os.environ.get("PROBE") == "1":
         probe()
+        return
+    if os.environ.get("SERVICE_ONLY") == "1":
+        service_only()
         return
     today = datetime.date.today()
     cn, sv, days_done = {}, {}, []
@@ -259,6 +268,91 @@ def main():
         for c, (k, a) in sorted(dct.items(), key=lambda x: -x[1][0])[:15]:
             print(f"CORP | {title} | {c} | {k}건 ({k / tot:.0%}) | "
                   f"{a / 1e4:,.0f}만원")
+
+
+# ------------------------------------------------------------
+# 기술지도 용역만: 건설 / 전기·통신 분야별 시장·점유율 (SERVICE_ONLY=1)
+# ------------------------------------------------------------
+# 2026 민간재해예방기관 평가 결과 PDF 중 부산청 전기·통신 분야 기관(이름 일부)
+ELEC_CORPS = ("한국전기통신안전", "정보통신공사협회", "전기공사협회",
+              "대한안전기술원", "한국재해예방안전원", "대승종합안전",
+              "서창안전기술원", "안전공감", "알파인", "정엔지니어링",
+              "이룸산업안전", "보배안전")
+ELEC_WORDS = ("전기", "통신", "소방")
+
+
+def field_of(it):
+    nm = str(it.get("cnstwkNm") or it.get("cntrctNm") or "")
+    if any(w in nm for w in ELEC_WORDS):
+        return "전기통신"
+    if any(c in corp_of(it) for c in ELEC_CORPS):
+        return "전기통신"
+    return "건설"
+
+
+def service_only():
+    today = datetime.date.today()
+    sv, days_done = {}, []
+    day = today - datetime.timedelta(days=1)
+    while CALLS[0] < MAX_CALLS and len(days_done) < 365:
+        b = fetch_day("getCntrctInfoListServc", day)
+        if b is None:
+            break
+        for it in b:
+            nm = str(it.get("cnstwkNm") or it.get("cntrctNm") or "")
+            if "기술지도" in nm.replace(" ", ""):
+                sv[it.get("untyCntrctNo") or it.get("cntrctRefNo")] = it
+        days_done.append(day)
+        if len(days_done) % 10 == 0:
+            print(f"  진행: {day}까지 {len(days_done)}일, 호출 {CALLS[0]}회, "
+                  f"기술지도 계약 {len(sv)}건", flush=True)
+        day -= datetime.timedelta(days=1)
+    n_days = len(days_done)
+    scale = 365 / n_days
+    print(f"수집기간(계약 등록일): {days_done[-1]} ~ {days_done[0]} "
+          f"({n_days}일, 연 환산 ×{scale:.2f}), 호출 {CALLS[0]}회, "
+          f"'기술지도' 계약 전국 {len(sv)}건")
+
+    agg = {}       # (권역, 분야) -> [건수, 금액]
+    corp = {}      # (권역, 분야, 업체) -> [건수, 금액]
+    sigun = {}     # (시군, 분야) -> [건수, 금액]
+    for it in sv.values():
+        rg = region_of(it)
+        if not rg:
+            continue
+        fd = field_of(it)
+        amt = num(it.get("totCntrctAmt")) or num(it.get("thtmCntrctAmt"))
+        areas = ["경남"] + (["창원권"] if rg in CORE else [])
+        for ar in areas:
+            a = agg.setdefault((ar, fd), [0, 0.0])
+            a[0] += 1
+            a[1] += amt
+            c = corp.setdefault((ar, fd, corp_of(it)), [0, 0.0])
+            c[0] += 1
+            c[1] += amt
+        g = sigun.setdefault((rg, fd), [0, 0.0])
+        g[0] += 1
+        g[1] += amt
+
+    print("\n=== 분야별 시장 (부가세 포함 계약금액, 연 환산) ===")
+    for (ar, fd), (k, a) in sorted(agg.items()):
+        print(f"MKT | {ar} | {fd} | 기간 {k}건 {a / 1e8:.2f}억 | "
+              f"연 {k * scale:.0f}건 {a * scale / 1e8:.1f}억 | "
+              f"건당 {a / k / 1e4:,.0f}만원")
+    print("\n=== 업체별 점유율 (건수 기준) ===")
+    for ar in ("창원권", "경남"):
+        for fd in ("건설", "전기통신"):
+            tot = agg.get((ar, fd), [0, 0])[0] or 1
+            rows = sorted(((c, v) for (a2, f2, c), v in corp.items()
+                           if a2 == ar and f2 == fd), key=lambda x: -x[1][0])
+            print(f"SHR | {ar} | {fd} | 업체 수 {len(rows)}")
+            for c, (k, a) in rows[:12]:
+                print(f"SHR | {ar} | {fd} | {c} | {k}건 ({k / tot:.1%}) | "
+                      f"연 {a * scale / 1e8:.2f}억")
+    print("\n=== 시군별 (연 환산 건수) ===")
+    for (rg, fd), (k, a) in sorted(sigun.items(), key=lambda x: -x[1][0]):
+        print(f"SGN | {rg} | {fd} | 연 {k * scale:.0f}건 | "
+              f"연 {a * scale / 1e8:.1f}억")
 
 
 if __name__ == "__main__":
