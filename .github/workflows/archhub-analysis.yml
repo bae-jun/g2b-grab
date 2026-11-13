@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       TZ: Asia/Seoul
-      SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+      SERVICE_KEY: ${{ secrets.DATA_KEY2 || secrets.SERVICE_KEY }}
       PROBE: "1"
     steps:
       - uses: actions/checkout@v4
